@@ -94,17 +94,43 @@ def run(link, title: str = "RC2014 Bridge"):
     surface = pygame.display.set_mode((screen_w, screen_h))
     clock = pygame.time.Clock()
 
+    scroll_offset = 0
     running = True
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif hasattr(pygame, "MOUSEWHEEL") and event.type == pygame.MOUSEWHEEL:
+                if event.y > 0:
+                    scroll_offset += 3 * event.y
+                elif event.y < 0:
+                    scroll_offset = max(0, scroll_offset + 3 * event.y)
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 4:  # Wheel up
+                    scroll_offset += 3
+                elif event.button == 5:  # Wheel down
+                    scroll_offset = max(0, scroll_offset - 3)
             elif event.type == pygame.KEYDOWN:
+                if event.mod & pygame.KMOD_SHIFT:
+                    if event.key == pygame.K_PAGEUP:
+                        scroll_offset += 10
+                    elif event.key == pygame.K_PAGEDOWN:
+                        scroll_offset = max(0, scroll_offset - 10)
+                    elif event.key == pygame.K_UP:
+                        scroll_offset += 1
+                    elif event.key == pygame.K_DOWN:
+                        scroll_offset = max(0, scroll_offset - 1)
+                    elif event.key == pygame.K_END:
+                        scroll_offset = 0
+                    continue
+
+                scroll_offset = 0
                 data = _key_to_bytes(event)
                 if data:
                     link.send_text(data.decode("latin-1"))
 
-        state = link.get_screen()
+        state = link.get_screen(scroll_offset=scroll_offset)
+        scroll_offset = state.get("scroll_offset", 0)
         surface.fill(BG)
         runs = state.get("runs")
         if runs:
@@ -142,13 +168,20 @@ def run(link, title: str = "RC2014 Bridge"):
                     img = font.render(line, False, FG, BG)
                     surface.blit(img, (0, row * cell_h))
 
-        if (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
+        if scroll_offset == 0 and (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
             cx, cy = state["cursor"]["x"], state["cursor"]["y"]
             rect = pygame.Rect(cx * cell_w, cy * cell_h, cell_w, cell_h)
             pygame.draw.rect(surface, CURSOR, rect, width=2)
+
+        if scroll_offset > 0:
+            badge_text = f" SCROLLBACK: -{scroll_offset} lines (Shift+End to exit) "
+            badge_img = font.render(badge_text, True, (255, 255, 255), (140, 30, 30))
+            badge_rect = badge_img.get_rect(topright=(screen_w - 5, 5))
+            surface.blit(badge_img, badge_rect)
 
         pygame.display.flip()
         clock.tick(30)
 
     pygame.quit()
+
 

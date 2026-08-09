@@ -70,7 +70,7 @@ class ApiServer:
             self.link.send_text(req["text"])
             return {"ok": True}
         if cmd == "get_screen":
-            return {"ok": True, **self.link.get_screen()}
+            return {"ok": True, **self.link.get_screen(req.get("scroll_offset", 0))}
         if cmd == "wait_for":
             return {"ok": True, **self.link.wait_for(req["pattern"], req.get("timeout", 10.0))}
         if cmd == "xmodem_send":

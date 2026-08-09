@@ -46,7 +46,7 @@ class SerialLink:
                                    stopbits=1, timeout=0.1)
         self._write_lock = threading.Lock()
 
-        self._screen = pyte.Screen(cols, rows)
+        self._screen = pyte.HistoryScreen(cols, rows, history=1000)
         self._stream = pyte.Stream(self._screen)
         self._screen_lock = threading.Lock()
 
@@ -126,16 +126,29 @@ class SerialLink:
     def send_text(self, text: str):
         self._write_raw(text.encode("latin-1"))
 
-    def get_screen(self) -> dict:
+    def get_screen(self, scroll_offset: int = 0) -> dict:
         with self._screen_lock:
-            lines = list(self._screen.display)
+            history_count = len(self._screen.history.top)
+            offset = max(0, min(scroll_offset, history_count))
             cx, cy = self._screen.cursor.x, self._screen.cursor.y
             runs = []
+            lines = []
             for r in range(self.rows):
+                idx = r - offset
+                if idx < 0:
+                    if abs(idx) <= history_count:
+                        row_cells = self._screen.history.top[idx]
+                    else:
+                        row_cells = self._screen.buffer[0]
+                else:
+                    row_cells = self._screen.buffer[idx]
+
                 row_runs = []
                 current_run = None
+                line_chars = []
                 for c in range(self.cols):
-                    char = self._screen.buffer[r][c]
+                    char = row_cells[c]
+                    line_chars.append(char.data)
                     style = (char.fg, char.bg, char.bold, char.underscore, char.reverse)
                     if current_run is None:
                         current_run = {
@@ -161,8 +174,10 @@ class SerialLink:
                 if current_run is not None:
                     row_runs.append(current_run)
                 runs.append(row_runs)
+                lines.append("".join(line_chars))
         return {"lines": lines, "cursor": {"x": cx, "y": cy},
-                "cols": self.cols, "rows": self.rows, "runs": runs}
+                "cols": self.cols, "rows": self.rows, "runs": runs,
+                "history_count": history_count, "scroll_offset": offset}
 
 
     def get_new_output(self) -> str:
