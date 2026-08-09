@@ -92,16 +92,14 @@ MENU_DATA = [
     {
         "title": "File",
         "items": [
-            {"label": "Send File via XMODEM... (F2)", "action": "PROMPT_SEND"},
-            {"label": "Receive File via XMODEM... (F3)", "action": "PROMPT_RECEIVE"},
             {"label": "Quit", "action": "QUIT"},
         ],
     },
     {
         "title": "Transfer",
         "items": [
-            {"label": "XMODEM Send... (F2)", "action": "PROMPT_SEND"},
-            {"label": "XMODEM Receive... (F3)", "action": "PROMPT_RECEIVE"},
+            {"label": "Send File (XMODEM)... (F2)", "action": "PROMPT_SEND"},
+            {"label": "Receive File (XMODEM)... (F3)", "action": "PROMPT_RECEIVE"},
         ],
     },
     {

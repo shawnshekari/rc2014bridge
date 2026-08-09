@@ -11,9 +11,11 @@ class TestGuiXmodem(unittest.TestCase):
         self.assertIn("View", titles)
 
         file_actions = [item["action"] for item in MENU_DATA[0]["items"]]
-        self.assertIn("PROMPT_SEND", file_actions)
-        self.assertIn("PROMPT_RECEIVE", file_actions)
         self.assertIn("QUIT", file_actions)
+
+        transfer_actions = [item["action"] for item in MENU_DATA[1]["items"]]
+        self.assertIn("PROMPT_SEND", transfer_actions)
+        self.assertIn("PROMPT_RECEIVE", transfer_actions)
 
     def test_async_xmodem_helpers_exist(self):
         from rc2014bridge.link import SerialLink
