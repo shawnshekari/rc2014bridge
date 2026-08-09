@@ -111,6 +111,63 @@ MENU_DATA = [
 ]
 
 
+import os
+import shutil
+import subprocess
+import threading
+
+
+def _open_system_file_dialog(mode: str = "open", title: str = "Select File") -> str | None:
+    # 1. Try zenity (native GTK dialog on Linux)
+    zenity_path = shutil.which("zenity")
+    if zenity_path:
+        cmd = [zenity_path, "--file-selection", f"--title={title}"]
+        if mode == "save":
+            cmd.append("--save")
+            cmd.append("--confirm-overwrite")
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                p = res.stdout.strip()
+                if p:
+                    return p
+            return None
+        except Exception:
+            pass
+
+    # 2. Try kdialog (native KDE dialog)
+    kdialog_path = shutil.which("kdialog")
+    if kdialog_path:
+        cmd = [kdialog_path, "--getsavefilename" if mode == "save" else "--getopenfilename", os.getcwd(), f"--title={title}"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if res.returncode == 0:
+                p = res.stdout.strip()
+                if p:
+                    return p
+            return None
+        except Exception:
+            pass
+
+    # 3. Try tkinter
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        if mode == "save":
+            p = filedialog.asksaveasfilename(title=title)
+        else:
+            p = filedialog.askopenfilename(title=title)
+        root.destroy()
+        return p if p else None
+    except Exception:
+        pass
+
+    return None
+
+
 def run(link, title: str = "RC2014 Bridge"):
     pygame.init()
     pygame.display.set_caption(title)
@@ -133,20 +190,6 @@ def run(link, title: str = "RC2014 Bridge"):
     toast_expires = 0.0
     running = True
 
-    def _trigger_action(action: str):
-        nonlocal prompt_mode, prompt_text, scroll_offset, running, active_menu_idx
-        active_menu_idx = None
-        if action == "PROMPT_SEND":
-            prompt_mode = "SEND"
-            prompt_text = ""
-        elif action == "PROMPT_RECEIVE":
-            prompt_mode = "RECEIVE"
-            prompt_text = ""
-        elif action == "RESET_SCROLLBACK":
-            scroll_offset = 0
-        elif action == "QUIT":
-            running = False
-
     def _on_xmodem_done(res: dict):
         nonlocal toast_text, toast_expires
         import time
@@ -157,6 +200,34 @@ def run(link, title: str = "RC2014 Bridge"):
         else:
             toast_text = f"XMODEM Error: {res.get('error', 'Failed')}"
         toast_expires = time.time() + 4.0
+
+    def _trigger_action(action: str):
+        nonlocal prompt_mode, prompt_text, scroll_offset, running, active_menu_idx
+        active_menu_idx = None
+        if action == "PROMPT_SEND":
+            def _send_worker():
+                nonlocal prompt_mode, prompt_text
+                path = _open_system_file_dialog(mode="open", title="Select File to Send via XMODEM")
+                if path:
+                    link.xmodem_send_async(path, callback=_on_xmodem_done)
+                elif not shutil.which("zenity") and not shutil.which("kdialog"):
+                    prompt_mode = "SEND"
+                    prompt_text = ""
+            threading.Thread(target=_send_worker, daemon=True).start()
+        elif action == "PROMPT_RECEIVE":
+            def _recv_worker():
+                nonlocal prompt_mode, prompt_text
+                path = _open_system_file_dialog(mode="save", title="Select Save Location for XMODEM Receive")
+                if path:
+                    link.xmodem_receive_async(path, callback=_on_xmodem_done)
+                elif not shutil.which("zenity") and not shutil.which("kdialog"):
+                    prompt_mode = "RECEIVE"
+                    prompt_text = ""
+            threading.Thread(target=_recv_worker, daemon=True).start()
+        elif action == "RESET_SCROLLBACK":
+            scroll_offset = 0
+        elif action == "QUIT":
+            running = False
 
     while running:
         import time
