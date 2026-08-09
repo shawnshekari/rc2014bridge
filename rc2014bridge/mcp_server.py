@@ -10,6 +10,7 @@ import threading
 from typing import Optional
 
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 import uvicorn
 
 logger = logging.getLogger("rc2014bridge.mcp")
@@ -161,7 +162,12 @@ class McpServer:
         def _run_server():
             try:
                 logger.info("Starting MCP HTTP/SSE server on %s:%d", self.host, self.port)
-                sse_app = self.mcp.sse_app()
+                sec_settings = TransportSecuritySettings(
+                    enable_dns_rebinding_protection=False,
+                    allowed_hosts=["*"],
+                    allowed_origins=["*"],
+                )
+                sse_app = self.mcp.sse_app(host=self.host, transport_security=sec_settings)
                 uvicorn.run(sse_app, host=self.host, port=self.port, log_level="warning")
             except Exception as e:
                 logger.exception("MCP Server error: %s", e)
