@@ -127,11 +127,14 @@ class McpServer:
             return f"Sent text to RC2014: {text!r}"
 
         @self.mcp.tool()
-        def rc2014_get_screen(max_lines: int = 0) -> str:
-            """Get rendered 80x48 screen lines and terminal scrollback history. Pass max_lines=0 for all history lines."""
-            logger.info("MCP Tool called: rc2014_get_screen(max_lines=%d)", max_lines)
+        def rc2014_get_screen(max_lines: int = 0, trim_empty: bool = True) -> str:
+            """Get rendered screen lines and terminal scrollback history. Pass max_lines=0 for all history lines. Set trim_empty=True (default) to strip trailing empty lines."""
+            logger.info("MCP Tool called: rc2014_get_screen(max_lines=%d, trim_empty=%s)", max_lines, trim_empty)
             sc = link.get_screen(max_lines=max_lines)
             lines = sc.get("lines", [])
+            if trim_empty:
+                while lines and not lines[-1].strip():
+                    lines.pop()
             return "\n".join(lines)
 
         @self.mcp.tool()
