@@ -316,8 +316,8 @@ class SerialLink:
             return {"ok": False, "error": "System is not at CP/M prompt (A> .. P>)"}
 
         # Query STAT first for drive capacity and access modes
-        time.sleep(0.15)
-        self.send_text("STAT\r")
+        time.sleep(0.2)
+        self._write_paced(b"STAT\r", chunk=1, delay=0.015)
         deadline = time.time() + 3.0
         sc = {}
         while time.time() < deadline:
@@ -336,9 +336,9 @@ class SerialLink:
         results = []
         for drv in drives_to_scan:
             dev_map = mapped.get(drv, "")
-            time.sleep(0.15)
+            time.sleep(0.2)
 
-            self.send_text(f"DIR {drv}:\r")
+            self._write_paced(f"DIR {drv}:\r".encode("latin-1"), chunk=1, delay=0.015)
 
             deadline = time.time() + 3.0
             sc = {}
@@ -469,7 +469,11 @@ class SerialLink:
     # terminal-mode API
     # ------------------------------------------------------------------
     def send_text(self, text: str):
-        self._write_raw(text.encode("latin-1"))
+        data = text.encode("latin-1")
+        if len(data) > 1:
+            self._write_paced(data, chunk=1, delay=0.015)
+        else:
+            self._write_raw(data)
 
     def get_screen(self, scroll_offset: int = 0) -> dict:
         now = time.time()
