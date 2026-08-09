@@ -478,8 +478,9 @@ def run(link, title: str = "RC2014 Bridge"):
         conn_img = status_font.render(conn_text, True, (170, 185, 200))
         surface.blit(conn_img, (10, status_y + (STATUS_BAR_HEIGHT - conn_img.get_height()) // 2))
 
-        # Mode Badge
+        # Mode & System Environment Badge
         mode = state.get("mode", "terminal").upper()
+        sys_env = state.get("system_state", "unknown").upper()
         xp = state.get("xmodem_progress", {})
         if xp.get("active"):
             mode_label = f"XMODEM-{xp.get('direction', 'TRANSFER')}"
@@ -489,10 +490,22 @@ def run(link, title: str = "RC2014 Bridge"):
             mode_label = "XMODEM"
             badge_bg = (180, 110, 20)
             badge_fg = (255, 240, 200)
-        else:
-            mode_label = "TERMINAL"
+        elif sys_env == "CPM":
+            mode_label = "CPM/ZSDOS"
             badge_bg = (24, 85, 45)
             badge_fg = (140, 255, 170)
+        elif sys_env == "HBIOS":
+            mode_label = "HBIOS"
+            badge_bg = (30, 80, 150)
+            badge_fg = (200, 230, 255)
+        elif sys_env == "FLASH_UTIL":
+            mode_label = "FLASH-UTIL"
+            badge_bg = (130, 40, 120)
+            badge_fg = (255, 210, 250)
+        else:
+            mode_label = "TERMINAL"
+            badge_bg = (40, 50, 60)
+            badge_fg = (180, 200, 220)
 
         badge_txt_img = status_font.render(f" {mode_label} ", True, badge_fg, badge_bg)
         badge_x = 10 + conn_img.get_width() + 14
