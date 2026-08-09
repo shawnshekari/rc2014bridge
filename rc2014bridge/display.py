@@ -114,15 +114,19 @@ def run(link, title: str = "RC2014 Bridge"):
                 if event.mod & pygame.KMOD_SHIFT:
                     if event.key == pygame.K_PAGEUP:
                         scroll_offset += 10
+                        continue
                     elif event.key == pygame.K_PAGEDOWN:
                         scroll_offset = max(0, scroll_offset - 10)
+                        continue
                     elif event.key == pygame.K_UP:
                         scroll_offset += 1
+                        continue
                     elif event.key == pygame.K_DOWN:
                         scroll_offset = max(0, scroll_offset - 1)
+                        continue
                     elif event.key == pygame.K_END:
                         scroll_offset = 0
-                    continue
+                        continue
 
                 scroll_offset = 0
                 data = _key_to_bytes(event)
