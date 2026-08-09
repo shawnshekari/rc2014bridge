@@ -39,6 +39,11 @@ class TestStatusBar(unittest.TestCase):
         self.assertEqual(xp["total_blocks"], 50)
         self.assertEqual(xp["direction"], "SEND")
 
+    def test_xmodem_path_handling(self):
+        import os
+        path = "/tmp/downloads/LEDSHOW.COM"
+        self.assertEqual(os.path.basename(path), "LEDSHOW.COM")
+
 
 if __name__ == "__main__":
     unittest.main()

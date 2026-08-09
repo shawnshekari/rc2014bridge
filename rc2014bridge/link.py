@@ -13,6 +13,7 @@ The port itself is opened once and held for the object's whole lifetime;
 switching modes never closes or reacquires it.
 """
 
+import os
 import queue
 import re
 import threading
