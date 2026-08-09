@@ -121,7 +121,7 @@ class McpServer:
 
         @self.mcp.tool()
         def rc2014_send_text(text: str, append_enter: bool = True) -> str:
-            """Send a text string or command to the RC2014 serial terminal (e.g. 'DIR A:', 'STAT', 'Z 2'). Automatically appends carriage return (Enter) if missing and paces multi-character transmissions with 15ms delays."""
+            """Send a text command to the RC2014 serial terminal (e.g. 'DIR A:', 'STAT', 'MBASIC'). Do NOT include control characters; Enter is automatically appended for you."""
             logger.info("MCP Tool called: rc2014_send_text(text=%r, append_enter=%s)", text, append_enter)
             link.send_text(text, append_enter=append_enter)
             return f"Sent text to RC2014: {text!r}"

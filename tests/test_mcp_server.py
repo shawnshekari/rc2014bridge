@@ -36,6 +36,9 @@ class TestMcpServer(unittest.TestCase):
         sl.send_text("Z 2\r")
         sl._write_paced.assert_called_with(b"Z 2\r", chunk=1, delay=0.015)
 
+        sl.send_text("DIR C:\\r")
+        sl._write_paced.assert_called_with(b"DIR C:\r", chunk=1, delay=0.015)
+
         sl.send_text("Y", append_enter=False)
         sl._write_raw.assert_called_with(b"Y")
 
