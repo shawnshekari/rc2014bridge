@@ -281,12 +281,15 @@ class SerialLink:
                     else:
                         self._write_raw(bytes([CAN, CAN]))
                         return {"ok": False, "error": f"block {blocknum} failed after {MAX_RETRIES} retries"}
-                    blocknum = (blocknum + 1) & 0xFF
-
-                for _attempt in range(5):
+                time.sleep(0.15)  # Allow Z80 receiver time to flush last block to disk/flash
+                for _attempt in range(10):
                     self._write_raw(bytes([EOT]))
-                    if self._xq_get(timeout=10.0) == ACK:
+                    resp = self._xq_get(timeout=2.0)
+                    if resp == ACK:
                         return {"ok": True, "blocks": len(blocks)}
+                    if resp == NAK:
+                        # Some CP/M receivers NAK the 1st EOT; send 2nd EOT immediately
+                        continue
                 self._write_raw(bytes([CAN, CAN]))
                 return {"ok": False, "error": "EOT not acknowledged"}
             except Exception as e:  # noqa: BLE001 - never leave the receiver hanging
