@@ -120,6 +120,7 @@ class SerialLink:
         self._last_tx_time = time.time()
         with self._write_lock:
             self._ser.write(data)
+            self._ser.flush()
 
     def _write_paced(self, data: bytes, chunk: int = 8, delay: float = 0.010):
         self._last_tx_time = time.time()
@@ -128,6 +129,7 @@ class SerialLink:
                 self._ser.write(data[i:i + chunk])
                 if i + chunk < len(data):
                     time.sleep(delay)
+            self._ser.flush()
 
     # ------------------------------------------------------------------
     # terminal-mode API
