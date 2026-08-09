@@ -80,6 +80,9 @@ class SerialLink:
             "direction": "",
         }
 
+        self._system_state = "unknown"
+        self._last_prompt = ""
+
         self._stop = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -89,8 +92,25 @@ class SerialLink:
     # ------------------------------------------------------------------
     def close(self):
         self._stop.set()
-        self._reader.join(timeout=2)
+        self._reader.join(timeout=1.0)
         self._ser.close()
+
+    def _update_system_state(self, text: str):
+        for line in text.splitlines():
+            line_s = line.strip()
+            if not line_s:
+                continue
+            if re.search(r"^[A-P]>|^[0-9]+[A-P]>|^[A-P][0-9]*:", line_s):
+                self._system_state = "cpm"
+                self._last_prompt = line_s
+            elif any(k in line_s for k in ["HBIOS>", "Boot:", "WBW", "[C]old"]):
+                self._system_state = "hbios"
+                self._last_prompt = line_s
+            elif any(k in line_s for k in ["FDU>", "FLASH>", "Command?"]):
+                self._system_state = "flash_util"
+                self._last_prompt = line_s
+            elif re.search(r"([A-Za-z0-9_-]+[:>])", line_s):
+                self._last_prompt = line_s
 
     # ------------------------------------------------------------------
     # reader thread
@@ -111,6 +131,7 @@ class SerialLink:
                     self._xmodem_q.put(b)
             else:
                 text = data.decode("latin-1")
+                self._update_system_state(text)
                 with self._screen_lock:
                     self._stream.feed(text)
                 with self._pending_lock:
@@ -207,6 +228,7 @@ class SerialLink:
                 "history_count": history_count, "scroll_offset": offset,
                 "port": self.port, "baud": self.baud, "mode": current_mode,
                 "rx_active": rx_active, "tx_active": tx_active,
+                "system_state": self._system_state, "last_prompt": self._last_prompt,
                 "xmodem_progress": dict(self._xmodem_progress)}
 
 
@@ -234,6 +256,11 @@ class SerialLink:
     # ------------------------------------------------------------------
     def xmodem_send(self, path: str, handshake_timeout: float = 30.0) -> dict:
         filename = os.path.basename(path)
+        pre_screen = self.get_screen()
+        pre_lines = [l.strip() for l in pre_screen.get("lines", []) if l.strip()]
+        pre_prompt = pre_lines[-1] if pre_lines else ""
+        generic_prompt_pattern = re.compile(r"([A-P]>|[0-9]+[A-P]>|HBIOS>|Boot:|FDU>|FLASH>|\w+>|\w+:)")
+
         with self._mode_lock:
             self._mode = "xmodem"
             self._xmodem_progress = {
@@ -294,7 +321,6 @@ class SerialLink:
                         self._write_raw(bytes([CAN, CAN]))
                         return {"ok": False, "error": f"block {blocknum} failed after {MAX_RETRIES} retries"}
                 time.sleep(0.15)  # Allow Z80 receiver time to flush last block to disk/flash
-                prompt_pattern = re.compile(r"[A-P]>")
 
                 for _attempt in range(5):
                     self._write_raw(bytes([EOT]))
@@ -308,14 +334,17 @@ class SerialLink:
                 with self._mode_lock:
                     self._mode = "terminal"
 
-                # Smart verification loop: verify CP/M prompt return on screen; if XM.COM is still hanging, retry EOT
+                # Multi-environment verification loop: verify return to pre-prompt or any valid system prompt
                 deadline = time.time() + 6.0
                 while time.time() < deadline:
                     time.sleep(0.3)
                     screen = self.get_screen()
                     lines = [l.strip() for l in screen.get("lines", []) if l.strip()]
-                    if lines and any(prompt_pattern.search(l) for l in lines[-4:]):
-                        return {"ok": True, "blocks": len(blocks)}
+                    if lines:
+                        last_few = " ".join(lines[-4:])
+                        if ("Receiving:" not in last_few and "File open" not in last_few and "To cancel:" not in last_few) and \
+                           ((pre_prompt and pre_prompt in last_few) or generic_prompt_pattern.search(last_few)):
+                            return {"ok": True, "blocks": len(blocks)}
                     self._write_raw(bytes([EOT]))
 
                 return {"ok": True, "blocks": len(blocks)}
