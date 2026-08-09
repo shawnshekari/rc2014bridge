@@ -134,6 +134,12 @@ class SerialLink:
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
+        # Send an initial CR to refresh prompt and detect system state immediately
+        def _initial_prompt_probe():
+            time.sleep(0.15)
+            self._write_raw(b"\r")
+        threading.Thread(target=_initial_prompt_probe, daemon=True).start()
+
     # ------------------------------------------------------------------
     # hardware info & reboot lifecycle
     # ------------------------------------------------------------------
