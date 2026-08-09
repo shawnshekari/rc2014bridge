@@ -41,6 +41,8 @@ def _checksum(data: bytes) -> int:
 
 class SerialLink:
     def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 24):
+        self.port = port
+        self.baud = baud
         self.cols, self.rows = cols, rows
         self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
                                    stopbits=1, timeout=0.1)
@@ -56,6 +58,17 @@ class SerialLink:
         self._mode = "terminal"
         self._mode_lock = threading.Lock()
         self._xmodem_q: "queue.Queue[int]" = queue.Queue()
+
+        self._last_rx_time = 0.0
+        self._last_tx_time = 0.0
+        self._xmodem_progress = {
+            "active": False,
+            "filename": "",
+            "current_block": 0,
+            "total_blocks": 0,
+            "bytes": 0,
+            "direction": "",
+        }
 
         self._stop = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -80,6 +93,7 @@ class SerialLink:
                 break
             if not data:
                 continue
+            self._last_rx_time = time.time()
             with self._mode_lock:
                 mode = self._mode
             if mode == "xmodem":
@@ -102,18 +116,12 @@ class SerialLink:
     # raw write (used by both terminal and xmodem paths)
     # ------------------------------------------------------------------
     def _write_raw(self, data: bytes):
+        self._last_tx_time = time.time()
         with self._write_lock:
             self._ser.write(data)
 
     def _write_paced(self, data: bytes, chunk: int = 8, delay: float = 0.010):
-        # The RC2014's UART can't reliably absorb a full XMODEM block (~133
-        # bytes) written in one unpaced burst at 115200 baud - it drops
-        # bytes, which shows up as a deterministic NAK on every retry, not
-        # random corruption. Tested empirically against the real hardware:
-        # 1ms inter-chunk delay fails 15/15 (chunk=16 and chunk=32); this
-        # chunk=8/delay=10ms combination is the one actually confirmed
-        # reliable (3/3), not just extrapolated from other combinations
-        # that happened to work individually.
+        self._last_tx_time = time.time()
         with self._write_lock:
             for i in range(0, len(data), chunk):
                 self._ser.write(data[i:i + chunk])
@@ -127,6 +135,9 @@ class SerialLink:
         self._write_raw(text.encode("latin-1"))
 
     def get_screen(self, scroll_offset: int = 0) -> dict:
+        now = time.time()
+        rx_active = (now - self._last_rx_time) < 0.250
+        tx_active = (now - self._last_tx_time) < 0.250
         with self._screen_lock:
             history_count = len(self._screen.history.top)
             offset = max(0, min(scroll_offset, history_count))
@@ -175,9 +186,16 @@ class SerialLink:
                     row_runs.append(current_run)
                 runs.append(row_runs)
                 lines.append("".join(line_chars))
+
+        with self._mode_lock:
+            current_mode = self._mode
+
         return {"lines": lines, "cursor": {"x": cx, "y": cy},
                 "cols": self.cols, "rows": self.rows, "runs": runs,
-                "history_count": history_count, "scroll_offset": offset}
+                "history_count": history_count, "scroll_offset": offset,
+                "port": self.port, "baud": self.baud, "mode": current_mode,
+                "rx_active": rx_active, "tx_active": tx_active,
+                "xmodem_progress": dict(self._xmodem_progress)}
 
 
     def get_new_output(self) -> str:
@@ -202,15 +220,18 @@ class SerialLink:
     # XMODEM sender
     # ------------------------------------------------------------------
     def xmodem_send(self, path: str, handshake_timeout: float = 30.0) -> dict:
+        filename = os.path.basename(path)
         with self._mode_lock:
             self._mode = "xmodem"
+            self._xmodem_progress = {
+                "active": True,
+                "filename": filename,
+                "current_block": 0,
+                "total_blocks": 0,
+                "bytes": 0,
+                "direction": "SEND",
+            }
         try:
-            # Trailing terminal-mode text (e.g. the receiver's own banner)
-            # is often still in flight from the hardware at the instant we
-            # switch modes - it can contain a stray 'C' (as in "Ctrl-X")
-            # that would otherwise be mistaken for the real handshake poke.
-            # Settle briefly, then clear whatever accumulated during that
-            # window, before trusting anything read from the queue.
             time.sleep(0.3)
             with self._xmodem_q.mutex:
                 self._xmodem_q.queue.clear()
@@ -220,6 +241,9 @@ class SerialLink:
             blocks = [data[i:i + BLOCK_SIZE] for i in range(0, len(data), BLOCK_SIZE)] or [b""]
             if len(blocks[-1]) < BLOCK_SIZE:
                 blocks[-1] = blocks[-1] + bytes([SUB]) * (BLOCK_SIZE - len(blocks[-1]))
+
+            with self._mode_lock:
+                self._xmodem_progress["total_blocks"] = len(blocks)
 
             use_crc = None
             deadline = time.time() + handshake_timeout
@@ -234,16 +258,12 @@ class SerialLink:
             if use_crc is None:
                 return {"ok": False, "error": "handshake timeout waiting for receiver"}
 
-            # Some receivers (e.g. RomWBW's XM.COM) send a trailing 'K' after
-            # 'C' to hint they'd prefer 1K/STX blocks. We stick with plain
-            # 128-byte SOH blocks (protocol-legal), but must drain that hint
-            # byte here or it gets misread as the ACK/NAK for block 1.
             while self._xq_get(timeout=0.4) is not None:
                 pass
 
             try:
                 blocknum = 1
-                for block in blocks:
+                for idx, block in enumerate(blocks, start=1):
                     for _attempt in range(MAX_RETRIES):
                         pkt = bytes([SOH, blocknum & 0xFF, (~blocknum) & 0xFF]) + block
                         pkt += bytes([_crc16(block) >> 8, _crc16(block) & 0xFF]) if use_crc \
@@ -251,6 +271,9 @@ class SerialLink:
                         self._write_paced(pkt)
                         resp = self._xq_get(timeout=10.0)
                         if resp == ACK:
+                            with self._mode_lock:
+                                self._xmodem_progress["current_block"] = idx
+                                self._xmodem_progress["bytes"] = idx * BLOCK_SIZE
                             break
                         if resp == CAN:
                             return {"ok": False, "error": "receiver cancelled transfer"}
@@ -271,14 +294,24 @@ class SerialLink:
         finally:
             with self._mode_lock:
                 self._mode = "terminal"
+                self._xmodem_progress["active"] = False
 
     # ------------------------------------------------------------------
     # XMODEM receiver
     # ------------------------------------------------------------------
     def xmodem_receive(self, path: str, handshake_timeout: float = 30.0,
                         overall_timeout: float = 120.0) -> dict:
+        filename = os.path.basename(path)
         with self._mode_lock:
             self._mode = "xmodem"
+            self._xmodem_progress = {
+                "active": True,
+                "filename": filename,
+                "current_block": 0,
+                "total_blocks": 0,
+                "bytes": 0,
+                "direction": "RECV",
+            }
         try:
             time.sleep(0.3)  # see comment in xmodem_send
             with self._xmodem_q.mutex:
@@ -331,6 +364,9 @@ class SerialLink:
                 if valid and blk == (expect_block & 0xFF):
                     out.extend(payload)
                     expect_block += 1
+                    with self._mode_lock:
+                        self._xmodem_progress["current_block"] = expect_block - 1
+                        self._xmodem_progress["bytes"] = len(out)
                     self._write_raw(bytes([ACK]))
                 elif valid and blk == ((expect_block - 1) & 0xFF):
                     # receiver already had this block (our ACK got lost) - ack again, don't re-append
@@ -342,3 +378,4 @@ class SerialLink:
         finally:
             with self._mode_lock:
                 self._mode = "terminal"
+                self._xmodem_progress["active"] = False
