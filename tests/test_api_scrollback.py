@@ -17,9 +17,9 @@ class TestApiScrollback(unittest.TestCase):
             for i in range(50):
                 link._stream.feed(f"Line {i+1}\r\n")
 
-        # 1. Default call (no max_lines) returns rows=24 lines
+        # 1. Default call (no max_lines) returns rows=48 lines
         sc_default = link.get_screen()
-        self.assertEqual(len(sc_default["lines"]), 24)
+        self.assertEqual(len(sc_default["lines"]), 48)
 
         # 2. Call with max_lines=0 (all history) returns > 24 lines
         sc_all = link.get_screen(max_lines=0)

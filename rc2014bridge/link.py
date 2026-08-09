@@ -180,7 +180,7 @@ def _classify_drive_purpose(drive: str, files: list[str], device_map: str = "") 
 
 
 class SerialLink:
-    def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 24, hw_info_file: str = "hardware_info.json"):
+    def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 48, hw_info_file: str = "hardware_info.json"):
         self.port = port
         self.baud = baud
         self.cols, self.rows = cols, rows

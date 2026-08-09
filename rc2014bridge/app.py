@@ -15,7 +15,7 @@ def main():
     p.add_argument("--port", default="/dev/ttyUSB0")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--cols", type=int, default=80)
-    p.add_argument("--rows", type=int, default=24)
+    p.add_argument("--rows", type=int, default=48)
     p.add_argument("--sock", default=DEFAULT_SOCK)
     p.add_argument("--log-file", default=DEFAULT_LOG, help="Path to log file")
     p.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG level logging")

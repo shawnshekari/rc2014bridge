@@ -581,10 +581,10 @@ def run(link, title: str = "RC2014 Bridge"):
                 drives_map = hw_info.get("drive_mappings", {})
                 drives = [
                     {"drive": f"{k}:", "device": v, "files_count": "?", "purpose": "Unscanned (Press F6 to Catalog)"}
-                    for k, v in list(drives_map.items())[:6]
+                    for k, v in list(drives_map.items())[:10]
                 ]
 
-            for drv in drives[:6]:
+            for drv in drives[:10]:
                 d_name = drv.get("drive", "")
                 d_dev = drv.get("device", "")
                 d_count = drv.get("files_count", 0)
