@@ -260,19 +260,14 @@ class SerialLink:
 
             use_crc = None
             deadline = time.time() + handshake_timeout
-            next_poke = 0.0
             while time.time() < deadline:
-                b = self._xq_get(timeout=0.5)
+                b = self._xq_get(timeout=1.0)
                 if b == ord("C"):
                     use_crc = True
                     break
                 if b == NAK:
                     use_crc = False
                     break
-                if time.time() >= next_poke:
-                    # Poke with a CR to wake up receivers waiting for console carriage return
-                    self._write_raw(b"\r")
-                    next_poke = time.time() + 3.0
             if use_crc is None:
                 return {"ok": False, "error": "handshake timeout waiting for receiver"}
 
@@ -303,8 +298,6 @@ class SerialLink:
                     self._write_raw(bytes([EOT]))
                     resp = self._xq_get(timeout=2.0)
                     if resp == ACK:
-                        time.sleep(0.1)
-                        self._write_raw(b"\r")
                         return {"ok": True, "blocks": len(blocks)}
                     if resp == NAK:
                         # Some CP/M receivers NAK the 1st EOT; send 2nd EOT immediately
