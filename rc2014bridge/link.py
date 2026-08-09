@@ -119,16 +119,23 @@ def _parse_zsdos_banner(text: str) -> dict:
 
 def _parse_cpm_dir_output(text: str) -> list[str]:
     files = []
+    ignored = {"NO", "FILE", "DIR", "BYTES", "FREE", "USAGE", "KB", "DRIVE", "UNIT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
     for line in text.splitlines():
-        line_clean = re.sub(r"^[A-P]:", "", line.strip())
-        parts = line_clean.split(":")
+        line_clean = re.sub(r"^[A-P]>", "", line.strip())
+        if "No File" in line_clean or "NO FILE" in line_clean:
+            continue
+        parts = re.split(r"[|:]", line_clean)
         for part in parts:
             p_str = part.strip()
-            m = re.match(r"^([A-Z0-9_\$]{1,8})\s+([A-Z0-9_\$]{1,3})$", p_str)
+            if not p_str:
+                continue
+            m = re.match(r"^([A-Z0-9_\$]{1,8})\s+\.?\s*([A-Z0-9_\$]{1,3})$", p_str, re.IGNORECASE)
             if m:
-                fname = f"{m.group(1)}.{m.group(2)}"
-                if fname not in files:
-                    files.append(fname)
+                name, ext = m.group(1).upper(), m.group(2).upper()
+                if name not in ignored:
+                    fname = f"{name}.{ext}"
+                    if fname not in files:
+                        files.append(fname)
     return files
 
 
@@ -283,6 +290,9 @@ class SerialLink:
         for drv in drives_to_scan:
             dev_map = mapped.get(drv, "")
             time.sleep(0.15)
+            sc_before = self.get_screen()
+            sc_before_text = "\n".join(sc_before.get("lines", []))
+
             self.send_text(f"DIR {drv}:\r")
 
             deadline = time.time() + 3.0
@@ -295,7 +305,8 @@ class SerialLink:
                 if sc_lines and re.search(r"^[A-P]>|^[0-9]+[A-P]>", sc_lines[-1]):
                     break
 
-            files = _parse_cpm_dir_output(sc_text)
+            new_text = sc_text[len(sc_before_text):] if len(sc_text) >= len(sc_before_text) else sc_text
+            files = _parse_cpm_dir_output(new_text if new_text.strip() else sc_text)
             purpose = _classify_drive_purpose(f"{drv}:", files, dev_map)
             drv_info = {
                 "drive": f"{drv}:",
