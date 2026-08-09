@@ -588,12 +588,14 @@ def run(link, title: str = "RC2014 Bridge"):
                 d_name = drv.get("drive", "")
                 d_dev = drv.get("device", "")
                 d_count = drv.get("files_count", 0)
+                d_free = drv.get("free_space", "")
                 d_purp = drv.get("purpose", "")
 
-                lbl_img = font.render(f"   * {d_name:<3} [{d_dev:<8}] ({d_count:>2} files)", True, (200, 230, 200))
+                space_str = f", {d_free} free" if d_free and d_free != "?" else ""
+                lbl_img = font.render(f"   * {d_name:<3} [{d_dev:<7}] ({d_count:>2} files{space_str})", True, (200, 230, 200))
                 purp_img = font.render(f" -> {d_purp}", True, (255, 215, 120))
                 surface.blit(lbl_img, (box_x + 12, y_curr))
-                surface.blit(purp_img, (box_x + 340, y_curr))
+                surface.blit(purp_img, (box_x + 360, y_curr))
                 y_curr += 22
 
         # --------------------------------------------------------------

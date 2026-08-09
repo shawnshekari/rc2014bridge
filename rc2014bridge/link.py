@@ -117,8 +117,20 @@ def _parse_zsdos_banner(text: str) -> dict:
     return info
 
 
+def _parse_stat_output(text: str) -> dict:
+    info = {}
+    for line in text.splitlines():
+        m = re.search(r"([A-P]):\s+(R/[WO]),\s+Space:\s+(\d+k)", line, re.IGNORECASE)
+        if m:
+            info[m.group(1).upper()] = {
+                "access": m.group(2).upper(),
+                "free_space": m.group(3),
+            }
+    return info
+
+
 def _extract_drive_dir_block(full_text: str, drive_letter: str) -> str:
-    pattern = rf"[A-P]>DIR\s+{drive_letter}:(.*?)(?=[A-P]>|\Z)"
+    pattern = rf"[A-P]>(?:DIR\s+)?{drive_letter}:?(.*?)(?=[A-P]>|\Z)"
     m = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
     if m:
         return m.group(1).strip()
@@ -127,10 +139,10 @@ def _extract_drive_dir_block(full_text: str, drive_letter: str) -> str:
 
 def _parse_cpm_dir_output(text: str) -> list[str]:
     files = []
-    ignored = {"NO", "FILE", "DIR", "BYTES", "FREE", "USAGE", "KB", "DRIVE", "UNIT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+    ignored = {"NO", "FILE", "DIR", "BYTES", "FREE", "USAGE", "KB", "DRIVE", "UNIT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "STAT"}
     for line in text.splitlines():
         line_clean = re.sub(r"^[A-P]>", "", line.strip())
-        if "No File" in line_clean or "NO FILE" in line_clean:
+        if "No File" in line_clean or "NO FILE" in line_clean or "Space:" in line_clean:
             continue
         parts = re.split(r"[|:]", line_clean)
         for part in parts:
@@ -303,6 +315,21 @@ class SerialLink:
         if not re.search(r"^[A-P]>|^[0-9]+[A-P]>", last_line):
             return {"ok": False, "error": "System is not at CP/M prompt (A> .. P>)"}
 
+        # Query STAT first for drive capacity and access modes
+        time.sleep(0.15)
+        self.send_text("STAT\r")
+        deadline = time.time() + 3.0
+        sc = {}
+        while time.time() < deadline:
+            time.sleep(0.15)
+            sc = self.get_screen()
+            sc_lines = [l.strip() for l in sc.get("lines", []) if l.strip()]
+            if sc_lines and re.search(r"^[A-P]>|^[0-9]+[A-P]>", sc_lines[-1]):
+                break
+
+        full_hist_text = self._get_full_screen_history_text()
+        stat_data = _parse_stat_output(full_hist_text)
+
         mapped = self.hardware_info.get("drive_mappings", {})
         drives_to_scan = list(mapped.keys()) if mapped else ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
@@ -326,12 +353,15 @@ class SerialLink:
             dir_block = _extract_drive_dir_block(full_history_text, drv)
             files = _parse_cpm_dir_output(dir_block) if dir_block else []
             purpose = _classify_drive_purpose(f"{drv}:", files, dev_map)
+            st_info = stat_data.get(drv, {})
 
             drv_info = {
                 "drive": f"{drv}:",
                 "device": dev_map or "Unknown",
                 "files_count": len(files),
                 "files_sample": files[:6],
+                "free_space": st_info.get("free_space", "?"),
+                "access": st_info.get("access", "R/W"),
                 "purpose": purpose,
             }
             results.append(drv_info)
