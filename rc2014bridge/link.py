@@ -163,17 +163,31 @@ class SerialLink:
             logger.warning("Failed to save hardware info: %s", e)
 
     def reboot(self):
-        logger.info("Executing reboot for RC2014 system_state=%r", self._system_state)
+        screen = self.get_screen()
+        lines = [l.strip() for l in screen.get("lines", []) if l.strip()]
+        last_line = lines[-1] if lines else ""
+        logger.info("reboot() called. Last line on screen: %r, current system_state: %r", last_line, self._system_state)
+
         with self._mode_lock:
             self._mode = "terminal"
-        if self._system_state == "cpm":
+
+        self._system_state = "unknown"
+
+        # Check prompt directly from current rendered screen
+        if re.search(r"^[A-P]>|^[0-9]+[A-P]>", last_line):
+            logger.info("Direct prompt match CP/M (%r). Sending C:REBOOT /C", last_line)
             self._write_raw(b"C:REBOOT /C\r")
-        elif self._system_state in ("hbios", "flash_util"):
+        elif re.search(r"HBIOS>|Boot:|Boot\s*\[", last_line, re.IGNORECASE):
+            logger.info("Direct prompt match HBIOS (%r). Sending R", last_line)
+            self._write_raw(b"R\r")
+        elif re.search(r"FDU>|FLASH>", last_line, re.IGNORECASE):
+            logger.info("Direct prompt match FLASH_UTIL (%r). Sending R", last_line)
             self._write_raw(b"R\r")
         else:
+            logger.info("Prompt ambiguous (%r). Sending C:REBOOT /C and fallback R", last_line)
             self._write_raw(b"C:REBOOT /C\r")
             time.sleep(0.4)
-            self._write_raw(b"\rR\r")
+            self._write_raw(b"R\r")
 
     def close(self):
         self._stop.set()
@@ -185,7 +199,7 @@ class SerialLink:
         if len(self._boot_buffer) > 8192:
             self._boot_buffer = self._boot_buffer[-4096:]
 
-        if "RomWBW" in text or "HBIOS" in text or "Boot:" in text:
+        if "RomWBW" in text or "HBIOS" in text or "Boot:" in text or "Boot [" in text:
             parsed = _parse_boot_banner(self._boot_buffer)
             if parsed.get("version") or parsed.get("devices"):
                 self.hardware_info.update({k: v for k, v in parsed.items() if v})
@@ -200,12 +214,12 @@ class SerialLink:
                     logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
                 self._system_state = "cpm"
                 self._last_prompt = line_s
-            elif re.search(r"^HBIOS>|^Boot:|^Select \(A-F", line_s):
+            elif re.search(r"^HBIOS>|^Boot:|^Boot\s*\[|^Select \(A-F", line_s, re.IGNORECASE):
                 if self._system_state != "hbios":
                     logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
                 self._system_state = "hbios"
                 self._last_prompt = line_s
-            elif re.search(r"^FDU>|^FLASH>|^Command\?", line_s):
+            elif re.search(r"^FDU>|^FLASH>|^Command\?", line_s, re.IGNORECASE):
                 if self._system_state != "flash_util":
                     logger.info("Detected RC2014 system state: FLASH_UTIL (prompt: %r)", line_s)
                 self._system_state = "flash_util"
