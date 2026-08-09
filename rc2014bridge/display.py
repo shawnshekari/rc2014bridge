@@ -292,8 +292,10 @@ def run(link, title: str = "RC2014 Bridge"):
                     if dd_rect.collidepoint(mx, my):
                         item_idx = (my - TOP_MENU_HEIGHT - 4) // 26
                         if 0 <= item_idx < len(items):
-                            _trigger_action(items[item_idx]["action"])
-                            clicked_menu_item = True
+                            it_act = items[item_idx]["action"]
+                            if not (it_act == "SCAN_DRIVES" and getattr(link, "_system_state", "cpm") != "cpm"):
+                                _trigger_action(it_act)
+                                clicked_menu_item = True
 
                 if not clicked_menu_item:
                     if my < TOP_MENU_HEIGHT:
@@ -357,7 +359,11 @@ def run(link, title: str = "RC2014 Bridge"):
                     _trigger_action("SHOW_HW_INFO")
                     continue
                 elif event.key == pygame.K_F6:
-                    _trigger_action("SCAN_DRIVES")
+                    if getattr(link, "_system_state", "cpm") == "cpm":
+                        _trigger_action("SCAN_DRIVES")
+                    else:
+                        toast_text = "Scan error: System must be in CP/M / ZSDOS mode"
+                        toast_expires = time.time() + 4.0
                     continue
 
                 if event.mod & pygame.KMOD_SHIFT:
@@ -480,9 +486,12 @@ def run(link, title: str = "RC2014 Bridge"):
             for i_idx, item in enumerate(items):
                 item_y = TOP_MENU_HEIGHT + 4 + i_idx * 26
                 item_rect = pygame.Rect(top_x + 1, item_y, max_item_w - 2, 26)
-                item_hover = item_rect.collidepoint(mx, my)
+                is_disabled = (item["action"] == "SCAN_DRIVES" and getattr(link, "_system_state", "cpm") != "cpm")
+                item_hover = item_rect.collidepoint(mx, my) and not is_disabled
 
-                if item_hover:
+                if is_disabled:
+                    lbl_img = menu_font.render(f" {item['label']}", True, (110, 115, 125))
+                elif item_hover:
                     pygame.draw.rect(surface, (45, 95, 165), item_rect)
                     lbl_img = menu_font.render(f" {item['label']}", True, (255, 255, 255))
                 else:
