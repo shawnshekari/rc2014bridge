@@ -120,21 +120,20 @@ class McpServer:
         link = self.link
 
         @self.mcp.tool()
-        def rc2014_send_text(text: str, append_enter: bool = True) -> str:
-            """Send a text command to the RC2014 serial terminal (e.g. 'DIR A:', 'STAT', 'MBASIC'). Do NOT include control characters; Enter is automatically appended for you."""
-            logger.info("MCP Tool called: rc2014_send_text(text=%r, append_enter=%s)", text, append_enter)
-            link.send_text(text, append_enter=append_enter)
+        def rc2014_send_text(text: str) -> str:
+            """Send a text command to the RC2014 serial terminal (e.g. 'DIR A:', 'STAT', 'MBASIC'). Enter is automatically appended for you."""
+            logger.info("MCP Tool called: rc2014_send_text(text=%r)", text)
+            link.send_text(text, append_enter=True)
             return f"Sent text to RC2014: {text!r}"
 
         @self.mcp.tool()
-        def rc2014_get_screen(max_lines: int = 0, trim_empty: bool = True) -> str:
-            """Get rendered screen lines and terminal scrollback history. Pass max_lines=0 for all history lines. Set trim_empty=True (default) to strip trailing empty lines."""
-            logger.info("MCP Tool called: rc2014_get_screen(max_lines=%d, trim_empty=%s)", max_lines, trim_empty)
+        def rc2014_get_screen(max_lines: int = 0) -> str:
+            """Get rendered screen lines and terminal scrollback history. Pass max_lines=0 for all history lines."""
+            logger.info("MCP Tool called: rc2014_get_screen(max_lines=%d)", max_lines)
             sc = link.get_screen(max_lines=max_lines)
             lines = sc.get("lines", [])
-            if trim_empty:
-                while lines and not lines[-1].strip():
-                    lines.pop()
+            while lines and not lines[-1].strip():
+                lines.pop()
             return "\n".join(lines)
 
         @self.mcp.tool()
