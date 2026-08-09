@@ -11,6 +11,7 @@ from typing import Optional
 
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.cors import CORSMiddleware
 import uvicorn
 
 logger = logging.getLogger("rc2014bridge.mcp")
@@ -180,6 +181,13 @@ class McpServer:
                     allowed_origins=["*"],
                 )
                 sse_app = self.mcp.sse_app(host=self.host, transport_security=sec_settings)
+                sse_app.add_middleware(
+                    CORSMiddleware,
+                    allow_origins=["*"],
+                    allow_credentials=True,
+                    allow_methods=["*"],
+                    allow_headers=["*"],
+                )
                 uvicorn.run(sse_app, host=self.host, port=self.port, log_level="info")
             except Exception as e:
                 logger.exception("MCP Server error: %s", e)
