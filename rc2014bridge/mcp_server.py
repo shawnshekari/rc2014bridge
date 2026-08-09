@@ -163,13 +163,13 @@ class McpServer:
 
         @self.mcp.tool()
         def rc2014_xmodem_send(path: str) -> dict:
-            """Send a local host file TO the RC2014. PREREQUISITE: You MUST first use rc2014_send_text to run 'XM R <filename>' on the RC2014, and verify via rc2014_get_screen that the RC2014 is waiting to receive before calling this tool!"""
+            """Send a local host file TO the RC2014. PREREQUISITE: You MUST first use rc2014_send_text to run 'XM R <FILENAME.EXT>' (e.g. 'XM R LEDSHOW.COM') on the RC2014, and verify via rc2014_get_screen that the RC2014 is waiting to receive before calling this tool!"""
             logger.info("MCP Tool called: rc2014_xmodem_send(path=%r)", path)
             return link.xmodem_send(path)
 
         @self.mcp.tool()
         def rc2014_xmodem_receive(path: str) -> dict:
-            """Receive a file FROM the RC2014 to the local host. PREREQUISITE: You MUST first use rc2014_send_text to run 'XM S <filename>' on the RC2014, and verify via rc2014_get_screen that the RC2014 is waiting to send before calling this tool!"""
+            """Receive a file FROM the RC2014 to the local host. PREREQUISITE: You MUST first use rc2014_send_text to run 'XM S <FILENAME.EXT>' (e.g. 'XM S TEST.TXT') on the RC2014, and verify via rc2014_get_screen that the RC2014 is waiting to send before calling this tool!"""
             logger.info("MCP Tool called: rc2014_xmodem_receive(path=%r)", path)
             return link.xmodem_receive(path)
 
