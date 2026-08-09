@@ -386,7 +386,7 @@ def run(link, title: str = "RC2014 Bridge"):
                 scroll_offset = 0
                 data = _key_to_bytes(event)
                 if data:
-                    link.send_text(data.decode("latin-1"))
+                    link.send_text(data.decode("latin-1"), append_enter=False)
 
         state = link.get_screen(scroll_offset=scroll_offset)
         scroll_offset = state.get("scroll_offset", 0)
