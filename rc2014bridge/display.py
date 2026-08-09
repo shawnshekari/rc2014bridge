@@ -12,6 +12,52 @@ CURSOR = (110, 255, 110)
 FONT_SIZE = 18
 CURSOR_BLINK_MS = 500
 
+ANSI_COLORS = {
+    "black": (0, 0, 0),
+    "red": (205, 0, 0),
+    "green": (0, 205, 0),
+    "brown": (205, 205, 0),  # pyte uses 'brown' for ANSI yellow
+    "blue": (0, 0, 238),
+    "magenta": (205, 0, 205),
+    "cyan": (0, 205, 205),
+    "white": (229, 229, 229),
+    "brightblack": (127, 127, 127),
+    "brightred": (255, 0, 0),
+    "brightgreen": (0, 255, 0),
+    "brightbrown": (255, 255, 0),
+    "brightblue": (92, 92, 255),
+    "brightmagenta": (255, 0, 255),
+    "brightcyan": (0, 255, 255),
+    "brightwhite": (255, 255, 255),
+}
+
+STANDARD_TO_BRIGHT = {
+    "black": "brightblack",
+    "red": "brightred",
+    "green": "brightgreen",
+    "brown": "brightbrown",
+    "blue": "brightblue",
+    "magenta": "brightmagenta",
+    "cyan": "brightcyan",
+    "white": "brightwhite",
+}
+
+
+def _resolve_color(color_val: str, default_rgb: tuple[int, int, int], is_bold: bool = False) -> tuple[int, int, int]:
+    if color_val == "default":
+        return default_rgb
+    color_name = color_val
+    if is_bold and color_name in STANDARD_TO_BRIGHT:
+        color_name = STANDARD_TO_BRIGHT[color_name]
+    if color_name in ANSI_COLORS:
+        return ANSI_COLORS[color_name]
+    if len(color_val) == 6:
+        try:
+            return (int(color_val[0:2], 16), int(color_val[2:4], 16), int(color_val[4:6], 16))
+        except ValueError:
+            pass
+    return default_rgb
+
 # name -> bytes, for keys that don't have a sensible event.unicode
 SPECIAL_KEYS = {
     pygame.K_RETURN: b"\r",
@@ -60,10 +106,41 @@ def run(link, title: str = "RC2014 Bridge"):
 
         state = link.get_screen()
         surface.fill(BG)
-        for row, line in enumerate(state["lines"]):
-            if line.strip():
-                img = font.render(line, False, FG, BG)
-                surface.blit(img, (0, row * cell_h))
+        runs = state.get("runs")
+        if runs:
+            for row, row_runs in enumerate(runs):
+                col_offset = 0
+                for run_data in row_runs:
+                    text = run_data["text"]
+                    if not text:
+                        continue
+                    fg_val = run_data.get("fg", "default")
+                    bg_val = run_data.get("bg", "default")
+                    bold = run_data.get("bold", False)
+                    reverse = run_data.get("reverse", False)
+                    underscore = run_data.get("underscore", False)
+
+                    fg_rgb = _resolve_color(fg_val, FG, is_bold=bold)
+                    bg_rgb = _resolve_color(bg_val, BG)
+
+                    if reverse:
+                        fg_rgb, bg_rgb = bg_rgb, fg_rgb
+
+                    img = font.render(text, False, fg_rgb, bg_rgb)
+                    x_pos = col_offset * cell_w
+                    y_pos = row * cell_h
+                    surface.blit(img, (x_pos, y_pos))
+
+                    if underscore:
+                        run_w = len(text) * cell_w
+                        pygame.draw.line(surface, fg_rgb, (x_pos, y_pos + cell_h - 1), (x_pos + run_w, y_pos + cell_h - 1))
+
+                    col_offset += len(text)
+        else:
+            for row, line in enumerate(state["lines"]):
+                if line.strip():
+                    img = font.render(line, False, FG, BG)
+                    surface.blit(img, (0, row * cell_h))
 
         if (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
             cx, cy = state["cursor"]["x"], state["cursor"]["y"]
@@ -74,3 +151,4 @@ def run(link, title: str = "RC2014 Bridge"):
         clock.tick(30)
 
     pygame.quit()
+

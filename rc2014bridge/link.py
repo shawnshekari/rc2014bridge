@@ -130,8 +130,40 @@ class SerialLink:
         with self._screen_lock:
             lines = list(self._screen.display)
             cx, cy = self._screen.cursor.x, self._screen.cursor.y
+            runs = []
+            for r in range(self.rows):
+                row_runs = []
+                current_run = None
+                for c in range(self.cols):
+                    char = self._screen.buffer[r][c]
+                    style = (char.fg, char.bg, char.bold, char.underscore, char.reverse)
+                    if current_run is None:
+                        current_run = {
+                            "text": char.data,
+                            "fg": char.fg,
+                            "bg": char.bg,
+                            "bold": char.bold,
+                            "underscore": char.underscore,
+                            "reverse": char.reverse,
+                        }
+                    elif (current_run["fg"], current_run["bg"], current_run["bold"], current_run["underscore"], current_run["reverse"]) == style:
+                        current_run["text"] += char.data
+                    else:
+                        row_runs.append(current_run)
+                        current_run = {
+                            "text": char.data,
+                            "fg": char.fg,
+                            "bg": char.bg,
+                            "bold": char.bold,
+                            "underscore": char.underscore,
+                            "reverse": char.reverse,
+                        }
+                if current_run is not None:
+                    row_runs.append(current_run)
+                runs.append(row_runs)
         return {"lines": lines, "cursor": {"x": cx, "y": cy},
-                "cols": self.cols, "rows": self.rows}
+                "cols": self.cols, "rows": self.rows, "runs": runs}
+
 
     def get_new_output(self) -> str:
         with self._pending_lock:
