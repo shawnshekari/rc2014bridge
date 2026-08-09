@@ -13,6 +13,7 @@ The port itself is opened once and held for the object's whole lifetime;
 switching modes never closes or reacquires it.
 """
 
+import logging
 import os
 import queue
 import re
@@ -21,6 +22,8 @@ import time
 
 import pyte
 import serial
+
+logger = logging.getLogger("rc2014bridge")
 
 SOH, EOT, ACK, NAK, CAN, SUB = 0x01, 0x04, 0x06, 0x15, 0x18, 0x1A
 BLOCK_SIZE = 128
@@ -101,12 +104,18 @@ class SerialLink:
             if not line_s:
                 continue
             if re.search(r"^[A-P]>|^[0-9]+[A-P]>|^[A-P][0-9]*:", line_s):
+                if self._system_state != "cpm":
+                    logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
                 self._system_state = "cpm"
                 self._last_prompt = line_s
-            elif any(k in line_s for k in ["HBIOS>", "Boot:", "WBW", "[C]old"]):
+            elif re.search(r"^HBIOS>|^Boot:|^Select \(A-F", line_s):
+                if self._system_state != "hbios":
+                    logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
                 self._system_state = "hbios"
                 self._last_prompt = line_s
-            elif any(k in line_s for k in ["FDU>", "FLASH>", "Command?"]):
+            elif re.search(r"^FDU>|^FLASH>|^Command\?", line_s):
+                if self._system_state != "flash_util":
+                    logger.info("Detected RC2014 system state: FLASH_UTIL (prompt: %r)", line_s)
                 self._system_state = "flash_util"
                 self._last_prompt = line_s
             elif re.search(r"([A-Za-z0-9_-]+[:>])", line_s):
@@ -256,10 +265,12 @@ class SerialLink:
     # ------------------------------------------------------------------
     def xmodem_send(self, path: str, handshake_timeout: float = 30.0) -> dict:
         filename = os.path.basename(path)
+        logger.info("xmodem_send initiated for file: %s (path: %s)", filename, path)
         pre_screen = self.get_screen()
         pre_lines = [l.strip() for l in pre_screen.get("lines", []) if l.strip()]
         pre_prompt = pre_lines[-1] if pre_lines else ""
         generic_prompt_pattern = re.compile(r"([A-P]>|[0-9]+[A-P]>|HBIOS>|Boot:|FDU>|FLASH>|\w+>|\w+:)")
+        logger.debug("Pre-transfer prompt snapshot: %r", pre_prompt)
 
         with self._mode_lock:
             self._mode = "xmodem"
@@ -285,6 +296,9 @@ class SerialLink:
             with self._mode_lock:
                 self._xmodem_progress["total_blocks"] = len(blocks)
 
+            logger.info("xmodem_send: file loaded (%d bytes, %d blocks)", len(data), len(blocks))
+            logger.info("Waiting for receiver handshake ('C' or NAK, timeout %.1fs)...", handshake_timeout)
+
             use_crc = None
             deadline = time.time() + handshake_timeout
             while time.time() < deadline:
@@ -296,7 +310,10 @@ class SerialLink:
                     use_crc = False
                     break
             if use_crc is None:
+                logger.error("xmodem_send: handshake timeout waiting for receiver")
                 return {"ok": False, "error": "handshake timeout waiting for receiver"}
+
+            logger.info("xmodem_send: handshake established using %s", "CRC16" if use_crc else "Checksum")
 
             while self._xq_get(timeout=0.4) is not None:
                 pass
@@ -304,38 +321,52 @@ class SerialLink:
             try:
                 blocknum = 1
                 for idx, block in enumerate(blocks, start=1):
-                    for _attempt in range(MAX_RETRIES):
+                    for attempt in range(1, MAX_RETRIES + 1):
                         pkt = bytes([SOH, blocknum & 0xFF, (~blocknum) & 0xFF]) + block
                         pkt += bytes([_crc16(block) >> 8, _crc16(block) & 0xFF]) if use_crc \
                             else bytes([_checksum(block)])
                         self._write_paced(pkt)
                         resp = self._xq_get(timeout=10.0)
                         if resp == ACK:
+                            logger.debug("Block %d/%d ACKed", idx, len(blocks))
                             with self._mode_lock:
                                 self._xmodem_progress["current_block"] = idx
                                 self._xmodem_progress["bytes"] = idx * BLOCK_SIZE
                             break
                         if resp == CAN:
+                            logger.warning("Receiver cancelled transfer on block %d", idx)
                             return {"ok": False, "error": "receiver cancelled transfer"}
+                        logger.warning("Block %d/%d (attempt %d) got response %r, retrying", idx, len(blocks), attempt, hex(resp) if resp else None)
                     else:
                         self._write_raw(bytes([CAN, CAN]))
+                        logger.error("Block %d failed after %d retries", blocknum, MAX_RETRIES)
                         return {"ok": False, "error": f"block {blocknum} failed after {MAX_RETRIES} retries"}
+
+                logger.info("All %d blocks transmitted successfully. Sending EOT...", len(blocks))
                 time.sleep(0.15)  # Allow Z80 receiver time to flush last block to disk/flash
 
-                for _attempt in range(5):
+                eot_ack = False
+                for attempt in range(1, 6):
                     self._write_raw(bytes([EOT]))
                     resp = self._xq_get(timeout=1.0)
+                    logger.debug("EOT attempt %d response: %r", attempt, hex(resp) if resp else None)
                     if resp == ACK:
+                        eot_ack = True
                         break
                     if resp == NAK:
                         continue
+
+                logger.info("EOT sequence finished (ACKed: %s). Switching back to terminal mode.", eot_ack)
 
                 # Switch back to terminal mode so incoming serial output feeds into screen buffer
                 with self._mode_lock:
                     self._mode = "terminal"
 
+                # Send a single CR to refresh prompt
+                self._write_raw(b"\r")
+
                 # Multi-environment verification loop: verify return to pre-prompt or any valid system prompt
-                deadline = time.time() + 6.0
+                deadline = time.time() + 4.0
                 while time.time() < deadline:
                     time.sleep(0.3)
                     screen = self.get_screen()
@@ -344,11 +375,13 @@ class SerialLink:
                         last_few = " ".join(lines[-4:])
                         if ("Receiving:" not in last_few and "File open" not in last_few and "To cancel:" not in last_few) and \
                            ((pre_prompt and pre_prompt in last_few) or generic_prompt_pattern.search(last_few)):
+                            logger.info("Verified system prompt return on screen: %r", last_few)
                             return {"ok": True, "blocks": len(blocks)}
-                    self._write_raw(bytes([EOT]))
 
+                logger.info("xmodem_send complete (%d blocks).", len(blocks))
                 return {"ok": True, "blocks": len(blocks)}
             except Exception as e:  # noqa: BLE001 - never leave the receiver hanging
+                logger.exception("Unexpected exception during xmodem_send: %s", e)
                 self._write_raw(bytes([CAN, CAN]))
                 return {"ok": False, "error": f"unexpected error: {e}"}
         finally:
