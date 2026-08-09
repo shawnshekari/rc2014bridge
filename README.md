@@ -56,7 +56,31 @@ JSON out:
 ```
 
 Commands: `send_text`, `get_screen`, `wait_for(pattern, timeout)`,
-`xmodem_send(path)`, `xmodem_receive(path)`.
+`xmodem_send(path)`, `xmodem_receive(path)`, `scan_drives`, `reboot`, `get_hardware_info`.
+
+## Model Context Protocol (MCP) HTTP Endpoint
+
+`rc2014bridge` includes a built-in **HTTP / SSE MCP Server** bound to **`0.0.0.0:8014`** by default. Any LLM on your local network (Claude Desktop, Cursor, Antigravity, Ollama agents, etc.) can connect over HTTP to interactively command the RC2014 and access system documentation.
+
+- **MCP Endpoint URL**: `http://<your-host-ip>:8014/sse`
+- **MCP Tools**: `rc2014_send_text`, `rc2014_get_screen`, `rc2014_wait_for`, `rc2014_scan_drives`, `rc2014_get_hardware_info`, `rc2014_reboot`, `rc2014_xmodem_send`, `rc2014_xmodem_receive`.
+- **MCP Resources**:
+  * `rc2014://docs/hardware-overview` : RC2014 Z80 hardware, MMU memory map, RomWBW BIOS, and serial pacing rules.
+  * `rc2014://docs/cpm-guide` : Quick reference for CP/M 2.2 / ZSDOS syntax and utility programs.
+  * `rc2014://system/hardware-info` : Live JSON snapshot of connected hardware specs and disk inventory.
+- **MCP Prompts**:
+  * `rc2014_assistant_instructions` : System prompt template for LLM retro-computing assistants.
+
+### Claude Desktop / Cursor Setup (`claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "rc2014bridge": {
+      "url": "http://192.168.1.50:8014/sse"
+    }
+  }
+}
+```
 
 ## Real hardware bugs found building this
 

@@ -9,9 +9,22 @@ Use this skill when interacting with, controlling, or querying an RC2014 Z80 vin
 
 ## Transport & Protocol
 
-`rc2014bridge` exposes a Unix Domain Socket at `/tmp/rc2014bridge.sock` using newline-delimited JSON messages.
+`rc2014bridge` exposes:
+1. **Model Context Protocol (MCP) HTTP / SSE Endpoint**: `http://<your-host-ip>:8014/sse` (bound to `0.0.0.0:8014` by default for local network LLM agents).
+2. **Unix Domain Socket**: `/tmp/rc2014bridge.sock` (newline-delimited JSON protocol).
+3. **CLI Client Helper**: `client.py` in workspace root.
 
-A command line client helper is available at `client.py` in the workspace root.
+---
+
+## MCP Server Resources & Prompts
+
+### MCP Resources
+- `rc2014://docs/hardware-overview` : RC2014 Z80 hardware, MMU memory map, RomWBW BIOS, and serial pacing rules.
+- `rc2014://docs/cpm-guide` : Quick reference for CP/M 2.2 / ZSDOS syntax and utility programs.
+- `rc2014://system/hardware-info` : Live JSON snapshot of connected hardware specs and disk inventory.
+
+### MCP Prompts
+- `rc2014_assistant_instructions` : System prompt template for LLM retro-computing assistants.
 
 ---
 

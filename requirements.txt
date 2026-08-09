@@ -1,3 +1,7 @@
 pygame
 pyserial
 pyte
+mcp
+uvicorn
+starlette
+sse-starlette
