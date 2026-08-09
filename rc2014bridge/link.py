@@ -282,10 +282,19 @@ class SerialLink:
         results = []
         for drv in drives_to_scan:
             dev_map = mapped.get(drv, "")
+            time.sleep(0.15)
             self.send_text(f"DIR {drv}:\r")
-            time.sleep(0.6)
-            sc = self.get_screen()
-            sc_text = "\n".join(sc.get("lines", []))
+
+            deadline = time.time() + 3.0
+            sc_text = ""
+            while time.time() < deadline:
+                time.sleep(0.15)
+                sc = self.get_screen()
+                sc_lines = [l.strip() for l in sc.get("lines", []) if l.strip()]
+                sc_text = "\n".join(sc.get("lines", []))
+                if sc_lines and re.search(r"^[A-P]>|^[0-9]+[A-P]>", sc_lines[-1]):
+                    break
+
             files = _parse_cpm_dir_output(sc_text)
             purpose = _classify_drive_purpose(f"{drv}:", files, dev_map)
             drv_info = {
