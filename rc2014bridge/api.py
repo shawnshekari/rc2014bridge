@@ -77,4 +77,9 @@ class ApiServer:
             return self.link.xmodem_send(req["path"])
         if cmd == "xmodem_receive":
             return self.link.xmodem_receive(req["path"])
+        if cmd == "reboot":
+            self.link.reboot()
+            return {"ok": True}
+        if cmd == "get_hardware_info":
+            return {"ok": True, "info": getattr(self.link, "hardware_info", {})}
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}

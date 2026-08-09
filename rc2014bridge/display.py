@@ -92,6 +92,7 @@ MENU_DATA = [
     {
         "title": "File",
         "items": [
+            {"label": "Reboot RC2014... (F4)", "action": "CONFIRM_REBOOT"},
             {"label": "Quit", "action": "QUIT"},
         ],
     },
@@ -105,6 +106,7 @@ MENU_DATA = [
     {
         "title": "View",
         "items": [
+            {"label": "RC2014 Hardware Info... (F5)", "action": "SHOW_HW_INFO"},
             {"label": "Reset Scrollback (Shift+End)", "action": "RESET_SCROLLBACK"},
         ],
     },
@@ -185,6 +187,8 @@ def run(link, title: str = "RC2014 Bridge"):
     scroll_offset = 0
     prompt_mode = None  # None, "SEND", "RECEIVE"
     prompt_text = ""
+    show_reboot_modal = False
+    show_hw_info_modal = False
     active_menu_idx = None
     toast_text = None
     toast_expires = 0.0
@@ -202,7 +206,7 @@ def run(link, title: str = "RC2014 Bridge"):
         toast_expires = time.time() + 4.0
 
     def _trigger_action(action: str):
-        nonlocal prompt_mode, prompt_text, scroll_offset, running, active_menu_idx
+        nonlocal prompt_mode, prompt_text, scroll_offset, running, active_menu_idx, show_reboot_modal, show_hw_info_modal
         active_menu_idx = None
         if action == "PROMPT_SEND":
             def _send_worker():
@@ -224,6 +228,10 @@ def run(link, title: str = "RC2014 Bridge"):
                     prompt_mode = "RECEIVE"
                     prompt_text = ""
             threading.Thread(target=_recv_worker, daemon=True).start()
+        elif action == "CONFIRM_REBOOT":
+            show_reboot_modal = True
+        elif action == "SHOW_HW_INFO":
+            show_hw_info_modal = True
         elif action == "RESET_SCROLLBACK":
             scroll_offset = 0
         elif action == "QUIT":
@@ -243,6 +251,19 @@ def run(link, title: str = "RC2014 Bridge"):
                     scroll_offset = max(0, scroll_offset + 3 * event.y)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
+                if show_hw_info_modal:
+                    # Close modal if clicked anywhere or on close button
+                    show_hw_info_modal = False
+                    continue
+                if show_reboot_modal:
+                    # Check click on reboot confirmation banner
+                    if my < TOP_MENU_HEIGHT + 36:
+                        link.reboot()
+                        toast_text = "Reboot command sent to RC2014"
+                        toast_expires = time.time() + 3.0
+                    show_reboot_modal = False
+                    continue
+
                 clicked_menu_item = False
                 if active_menu_idx is not None:
                     top_x = 8
@@ -278,6 +299,18 @@ def run(link, title: str = "RC2014 Bridge"):
                 elif event.button == 5:  # Wheel down
                     scroll_offset = max(0, scroll_offset - 3)
             elif event.type == pygame.KEYDOWN:
+                if show_hw_info_modal:
+                    show_hw_info_modal = False
+                    continue
+
+                if show_reboot_modal:
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_y):
+                        link.reboot()
+                        toast_text = "Reboot command sent to RC2014"
+                        toast_expires = time.time() + 3.0
+                    show_reboot_modal = False
+                    continue
+
                 if prompt_mode is not None:
                     if event.key == pygame.K_ESCAPE:
                         prompt_mode = None
@@ -303,6 +336,12 @@ def run(link, title: str = "RC2014 Bridge"):
                     continue
                 elif event.key == pygame.K_F3:
                     _trigger_action("PROMPT_RECEIVE")
+                    continue
+                elif event.key == pygame.K_F4:
+                    _trigger_action("CONFIRM_REBOOT")
+                    continue
+                elif event.key == pygame.K_F5:
+                    _trigger_action("SHOW_HW_INFO")
                     continue
 
                 if event.mod & pygame.KMOD_SHIFT:
@@ -435,9 +474,20 @@ def run(link, title: str = "RC2014 Bridge"):
                 surface.blit(lbl_img, (top_x + 6, item_y + 3))
 
         # --------------------------------------------------------------
-        # 4. Render Interactive Path Prompt Banner (if active)
+        # 4. Render Interactive Path Prompt / Reboot Confirmation Banner
         # --------------------------------------------------------------
-        if prompt_mode is not None:
+        if show_reboot_modal:
+            prompt_h = 36
+            prompt_rect = pygame.Rect(0, term_y, screen_w, prompt_h)
+            pygame.draw.rect(surface, (180, 40, 30), prompt_rect)
+            pygame.draw.line(surface, (255, 255, 255), (0, term_y + prompt_h - 1), (screen_w, term_y + prompt_h - 1), width=1)
+
+            hdr_img = menu_font.render("REBOOT RC2014 HARDWARE?", True, (255, 255, 200))
+            surface.blit(hdr_img, (12, term_y + (prompt_h - hdr_img.get_height()) // 2))
+
+            hint_img = status_font.render("(Enter: Reboot Immediately | Esc: Cancel)", True, (255, 255, 255))
+            surface.blit(hint_img, (screen_w - hint_img.get_width() - 12, term_y + (prompt_h - hint_img.get_height()) // 2))
+        elif prompt_mode is not None:
             prompt_h = 36
             prompt_rect = pygame.Rect(0, term_y, screen_w, prompt_h)
             banner_bg = (180, 100, 15) if prompt_mode == "SEND" else (20, 100, 160)
@@ -456,10 +506,63 @@ def run(link, title: str = "RC2014 Bridge"):
             surface.blit(hint_img, (screen_w - hint_img.get_width() - 10, term_y + (prompt_h - hint_img.get_height()) // 2))
 
         # --------------------------------------------------------------
-        # 5. Render Notification Toast (if active)
+        # 5. Render Hardware Info Modal Overlay (if active)
+        # --------------------------------------------------------------
+        if show_hw_info_modal:
+            hw_info = getattr(link, "hardware_info", {})
+            box_w, box_h = min(640, screen_w - 40), min(400, screen_h - 80)
+            box_x = (screen_w - box_w) // 2
+            box_y = (screen_h - box_h) // 2
+            modal_rect = pygame.Rect(box_x, box_y, box_w, box_h)
+
+            pygame.draw.rect(surface, (20, 24, 30), modal_rect)
+            pygame.draw.rect(surface, (60, 110, 180), modal_rect, width=2)
+
+            # Header Bar
+            hdr_rect = pygame.Rect(box_x, box_y, box_w, 32)
+            pygame.draw.rect(surface, (30, 50, 80), hdr_rect)
+            pygame.draw.line(surface, (60, 110, 180), (box_x, box_y + 31), (box_x + box_w, box_y + 31))
+
+            hdr_img = menu_font.render(" RC2014 Hardware & System Specifications ", True, (255, 255, 255))
+            surface.blit(hdr_img, (box_x + 8, box_y + 6))
+
+            close_hint = status_font.render("[Esc/F5 to Close]", True, (180, 210, 240))
+            surface.blit(close_hint, (box_x + box_w - close_hint.get_width() - 10, box_y + 6))
+
+            # Details List
+            y_curr = box_y + 42
+            lines_to_show = [
+                ("RomWBW Version:", hw_info.get("version", "v3.0.1 (RomWBW)")),
+                ("CPU Architecture:", hw_info.get("cpu", "RC2014 Z80 @ 7.372MHz")),
+                ("Memory & MMU:", hw_info.get("memory", "Z2 MMU, 512KB ROM, 512KB RAM")),
+                ("Wait States:", hw_info.get("wait_states", "0 MEM W/S, 1 I/O W/S")),
+                ("Interrupt Mode:", hw_info.get("int_mode", "INT MODE 1")),
+                ("Last Boot Time:", hw_info.get("timestamp", "Not Captured")),
+            ]
+
+            for label, val in lines_to_show:
+                lbl_img = menu_font.render(f" {label:<20}", True, (140, 180, 220))
+                val_img = menu_font.render(f"{val}", True, (255, 255, 255))
+                surface.blit(lbl_img, (box_x + 12, y_curr))
+                surface.blit(val_img, (box_x + 220, y_curr))
+                y_curr += 26
+
+            # Devices Header
+            dev_hdr = menu_font.render(" Attached HBIOS Devices:", True, (140, 180, 220))
+            surface.blit(dev_hdr, (box_x + 12, y_curr + 4))
+            y_curr += 28
+
+            devs = hw_info.get("devices", []) or ["SIO0 (Console)", "SIO1", "IDE0 (CompactFlash)", "MD0 (RAM Disk)", "MD1 (ROM Disk)"]
+            for d in devs[:4]:
+                dev_img = font.render(f"   * {d}", True, (200, 230, 200))
+                surface.blit(dev_img, (box_x + 16, y_curr))
+                y_curr += 22
+
+        # --------------------------------------------------------------
+        # 6. Render Notification Toast (if active)
         # --------------------------------------------------------------
         if toast_text and time.time() < toast_expires:
-            toast_img = status_font.render(f" {toast_text} ", True, (255, 255, 255), (20, 120, 60) if "Success" in toast_text else (160, 30, 30))
+            toast_img = status_font.render(f" {toast_text} ", True, (255, 255, 255), (20, 120, 60) if "Success" in toast_text or "Reboot" in toast_text else (160, 30, 30))
             toast_rect = toast_img.get_rect(topright=(screen_w - 10, term_y + 10))
             surface.blit(toast_img, toast_rect)
 

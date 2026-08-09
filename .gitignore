@@ -5,3 +5,5 @@ __pycache__/
 *.sys
 *.bin
 *.rom
+*.log
+hardware_info.json

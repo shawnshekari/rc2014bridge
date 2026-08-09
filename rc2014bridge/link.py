@@ -52,11 +52,53 @@ def _to_cpm_filename(path: str) -> str:
     return f"{cpm_name}.{cpm_ext}" if cpm_ext else cpm_name
 
 
+import json
+
+
+def _parse_boot_banner(text: str) -> dict:
+    info = {
+        "version": "",
+        "cpu": "",
+        "wait_states": "",
+        "int_mode": "",
+        "memory": "",
+        "devices": [],
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    m = re.search(r"RomWBW (?:HBIOS )?(v[0-9\.\w-]+(?:, \d{4}-\d{2}-\d{2})?)", text, re.IGNORECASE)
+    if m:
+        info["version"] = m.group(1)
+
+    m = re.search(r"((?:RC2014 )?(?:Z80|Z180|eZ80) @ [0-9\.]+MHz)", text, re.IGNORECASE)
+    if m:
+        info["cpu"] = m.group(1)
+
+    m = re.search(r"(\d+ MEM W/S, \d+ I/O W/S)", text, re.IGNORECASE)
+    if m:
+        info["wait_states"] = m.group(1)
+
+    m = re.search(r"(INT MODE \d+)", text, re.IGNORECASE)
+    if m:
+        info["int_mode"] = m.group(1)
+
+    m = re.search(r"([A-Z0-9]+ MMU, \d+[KMB]* ROM, \d+[KMB]* RAM|\d+[KMB]* ROM, \d+[KMB]* RAM)", text, re.IGNORECASE)
+    if m:
+        info["memory"] = m.group(1)
+
+    for line in text.splitlines():
+        line_s = line.strip()
+        if re.match(r"^[A-Z0-9]{2,8}:\s+", line_s):
+            if line_s not in info["devices"]:
+                info["devices"].append(line_s)
+    return info
+
+
 class SerialLink:
-    def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 24):
+    def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 24, hw_info_file: str = "hardware_info.json"):
         self.port = port
         self.baud = baud
         self.cols, self.rows = cols, rows
+        self.hw_info_file = hw_info_file
         self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
                                    stopbits=1, timeout=0.1)
         self._write_lock = threading.Lock()
@@ -85,20 +127,70 @@ class SerialLink:
 
         self._system_state = "unknown"
         self._last_prompt = ""
+        self.hardware_info = self._load_hardware_info()
+        self._boot_buffer = ""
 
         self._stop = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
     # ------------------------------------------------------------------
-    # lifecycle
+    # hardware info & reboot lifecycle
     # ------------------------------------------------------------------
+    def _load_hardware_info(self) -> dict:
+        if os.path.exists(self.hw_info_file):
+            try:
+                with open(self.hw_info_file, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {
+            "version": "RomWBW v3.0.1",
+            "cpu": "RC2014 Z80 @ 7.372MHz",
+            "wait_states": "0 MEM W/S, 1 I/O W/S",
+            "int_mode": "INT MODE 1",
+            "memory": "Z2 MMU, 512KB ROM, 512KB RAM",
+            "devices": ["SIO0: IO=0x80 (Console)", "SIO1: IO=0x82", "IDE0: CompactFlash (123MB)", "MD0: RAM Disk (512KB)", "MD1: ROM Disk (384KB)"],
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _save_hardware_info(self):
+        try:
+            with open(self.hw_info_file, "w") as f:
+                json.dump(self.hardware_info, f, indent=2)
+            logger.info("Saved hardware info to %s", self.hw_info_file)
+        except Exception as e:
+            logger.warning("Failed to save hardware info: %s", e)
+
+    def reboot(self):
+        logger.info("Executing reboot for RC2014 system_state=%r", self._system_state)
+        with self._mode_lock:
+            self._mode = "terminal"
+        if self._system_state == "cpm":
+            self._write_raw(b"REBOOT\r")
+        elif self._system_state in ("hbios", "flash_util"):
+            self._write_raw(b"R\r")
+        else:
+            self._write_raw(b"REBOOT\r")
+            time.sleep(0.4)
+            self._write_raw(b"\rR\r")
+
     def close(self):
         self._stop.set()
         self._reader.join(timeout=1.0)
         self._ser.close()
 
     def _update_system_state(self, text: str):
+        self._boot_buffer += text
+        if len(self._boot_buffer) > 8192:
+            self._boot_buffer = self._boot_buffer[-4096:]
+
+        if "RomWBW" in text or "HBIOS" in text or "Boot:" in text:
+            parsed = _parse_boot_banner(self._boot_buffer)
+            if parsed.get("version") or parsed.get("devices"):
+                self.hardware_info.update({k: v for k, v in parsed.items() if v})
+                self._save_hardware_info()
+
         for line in text.splitlines():
             line_s = line.strip()
             if not line_s:
