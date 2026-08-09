@@ -40,6 +40,15 @@ def _checksum(data: bytes) -> int:
     return sum(data) & 0xFF
 
 
+def _to_cpm_filename(path: str) -> str:
+    base = os.path.basename(path)
+    name, ext = os.path.splitext(base)
+    ext = ext.lstrip(".")
+    cpm_name = re.sub(r"[^A-Za-z0-9]", "", name)[:8].upper()
+    cpm_ext = re.sub(r"[^A-Za-z0-9]", "", ext)[:3].upper()
+    return f"{cpm_name}.{cpm_ext}" if cpm_ext else cpm_name
+
+
 class SerialLink:
     def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 24):
         self.port = port
@@ -219,6 +228,7 @@ class SerialLink:
                 return {"matched": False, "text": acc}
             time.sleep(0.05)
 
+
     # ------------------------------------------------------------------
     # XMODEM sender
     # ------------------------------------------------------------------
@@ -250,14 +260,19 @@ class SerialLink:
 
             use_crc = None
             deadline = time.time() + handshake_timeout
+            next_poke = 0.0
             while time.time() < deadline:
-                b = self._xq_get(timeout=1.0)
+                b = self._xq_get(timeout=0.5)
                 if b == ord("C"):
                     use_crc = True
                     break
                 if b == NAK:
                     use_crc = False
                     break
+                if time.time() >= next_poke:
+                    # Poke with a CR to wake up receivers waiting for console carriage return
+                    self._write_raw(b"\r")
+                    next_poke = time.time() + 3.0
             if use_crc is None:
                 return {"ok": False, "error": "handshake timeout waiting for receiver"}
 
@@ -288,6 +303,8 @@ class SerialLink:
                     self._write_raw(bytes([EOT]))
                     resp = self._xq_get(timeout=2.0)
                     if resp == ACK:
+                        time.sleep(0.1)
+                        self._write_raw(b"\r")
                         return {"ok": True, "blocks": len(blocks)}
                     if resp == NAK:
                         # Some CP/M receivers NAK the 1st EOT; send 2nd EOT immediately
