@@ -468,7 +468,11 @@ class SerialLink:
     # ------------------------------------------------------------------
     # terminal-mode API
     # ------------------------------------------------------------------
-    def send_text(self, text: str):
+    def send_text(self, text: str, append_enter: bool = True):
+        if text.endswith("\n") and not text.endswith("\r\n") and not text.endswith("\r"):
+            text = text[:-1] + "\r"
+        elif append_enter and not (text.endswith("\r") or text.endswith("\n")):
+            text += "\r"
         data = text.encode("latin-1")
         if len(data) > 1:
             self._write_paced(data, chunk=1, delay=0.015)

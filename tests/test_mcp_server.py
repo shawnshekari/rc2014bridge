@@ -20,6 +20,25 @@ class TestMcpServer(unittest.TestCase):
         self.assertEqual(server.port, 8014)
         self.assertIsNotNone(server.mcp)
 
+    def test_send_text_append_enter(self):
+        from rc2014bridge.link import SerialLink
+        sl = SerialLink.__new__(SerialLink)
+        sl._ser = MagicMock()
+        sl._write_paced = MagicMock()
+        sl._write_raw = MagicMock()
+
+        sl.send_text("Z 2")
+        sl._write_paced.assert_called_with(b"Z 2\r", chunk=1, delay=0.015)
+
+        sl.send_text("Z 2\n")
+        sl._write_paced.assert_called_with(b"Z 2\r", chunk=1, delay=0.015)
+
+        sl.send_text("Z 2\r")
+        sl._write_paced.assert_called_with(b"Z 2\r", chunk=1, delay=0.015)
+
+        sl.send_text("Y", append_enter=False)
+        sl._write_raw.assert_called_with(b"Y")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -120,10 +120,10 @@ class McpServer:
         link = self.link
 
         @self.mcp.tool()
-        def rc2014_send_text(text: str) -> str:
-            """Send a text string or command to the RC2014 serial terminal (e.g. 'DIR A:\\r', 'STAT\\r'). Automatically paced with 15ms delays."""
-            logger.info("MCP Tool called: rc2014_send_text(text=%r)", text)
-            link.send_text(text)
+        def rc2014_send_text(text: str, append_enter: bool = True) -> str:
+            """Send a text string or command to the RC2014 serial terminal (e.g. 'DIR A:', 'STAT', 'Z 2'). Automatically appends carriage return (Enter) if missing and paces multi-character transmissions with 15ms delays."""
+            logger.info("MCP Tool called: rc2014_send_text(text=%r, append_enter=%s)", text, append_enter)
+            link.send_text(text, append_enter=append_enter)
             return f"Sent text to RC2014: {text!r}"
 
         @self.mcp.tool()
