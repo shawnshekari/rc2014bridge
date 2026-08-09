@@ -294,16 +294,31 @@ class SerialLink:
                         self._write_raw(bytes([CAN, CAN]))
                         return {"ok": False, "error": f"block {blocknum} failed after {MAX_RETRIES} retries"}
                 time.sleep(0.15)  # Allow Z80 receiver time to flush last block to disk/flash
-                for _attempt in range(10):
+                prompt_pattern = re.compile(r"[A-P]>")
+
+                for _attempt in range(5):
                     self._write_raw(bytes([EOT]))
-                    resp = self._xq_get(timeout=2.0)
+                    resp = self._xq_get(timeout=1.0)
                     if resp == ACK:
-                        return {"ok": True, "blocks": len(blocks)}
+                        break
                     if resp == NAK:
-                        # Some CP/M receivers NAK the 1st EOT; send 2nd EOT immediately
                         continue
-                self._write_raw(bytes([CAN, CAN]))
-                return {"ok": False, "error": "EOT not acknowledged"}
+
+                # Switch back to terminal mode so incoming serial output feeds into screen buffer
+                with self._mode_lock:
+                    self._mode = "terminal"
+
+                # Smart verification loop: verify CP/M prompt return on screen; if XM.COM is still hanging, retry EOT
+                deadline = time.time() + 6.0
+                while time.time() < deadline:
+                    time.sleep(0.3)
+                    screen = self.get_screen()
+                    lines = [l.strip() for l in screen.get("lines", []) if l.strip()]
+                    if lines and any(prompt_pattern.search(l) for l in lines[-4:]):
+                        return {"ok": True, "blocks": len(blocks)}
+                    self._write_raw(bytes([EOT]))
+
+                return {"ok": True, "blocks": len(blocks)}
             except Exception as e:  # noqa: BLE001 - never leave the receiver hanging
                 self._write_raw(bytes([CAN, CAN]))
                 return {"ok": False, "error": f"unexpected error: {e}"}
