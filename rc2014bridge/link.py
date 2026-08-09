@@ -380,3 +380,22 @@ class SerialLink:
             with self._mode_lock:
                 self._mode = "terminal"
                 self._xmodem_progress["active"] = False
+
+    def xmodem_send_async(self, path: str, callback=None):
+        def _worker():
+            res = self.xmodem_send(path)
+            if callback:
+                callback(res)
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t
+
+    def xmodem_receive_async(self, path: str, callback=None):
+        def _worker():
+            res = self.xmodem_receive(path)
+            if callback:
+                callback(res)
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        return t
+

@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.COM
+*.sys
+*.bin
+*.rom

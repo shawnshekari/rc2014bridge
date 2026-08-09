@@ -85,24 +85,85 @@ def _key_to_bytes(event) -> bytes:
     return b""
 
 
+TOP_MENU_HEIGHT = 24
 STATUS_BAR_HEIGHT = 28
+
+MENU_DATA = [
+    {
+        "title": "File",
+        "items": [
+            {"label": "Send File via XMODEM... (F2)", "action": "PROMPT_SEND"},
+            {"label": "Receive File via XMODEM... (F3)", "action": "PROMPT_RECEIVE"},
+            {"label": "Quit", "action": "QUIT"},
+        ],
+    },
+    {
+        "title": "Transfer",
+        "items": [
+            {"label": "XMODEM Send... (F2)", "action": "PROMPT_SEND"},
+            {"label": "XMODEM Receive... (F3)", "action": "PROMPT_RECEIVE"},
+        ],
+    },
+    {
+        "title": "View",
+        "items": [
+            {"label": "Reset Scrollback (Shift+End)", "action": "RESET_SCROLLBACK"},
+        ],
+    },
+]
 
 
 def run(link, title: str = "RC2014 Bridge"):
     pygame.init()
     pygame.display.set_caption(title)
     font = pygame.font.SysFont("monospace", FONT_SIZE)
+    menu_font = pygame.font.SysFont("sans-serif", 13, bold=True)
     status_font = pygame.font.SysFont("monospace", 13, bold=True)
     cell_w, cell_h = font.size("M")
     screen_w = link.cols * cell_w
     term_h = link.rows * cell_h
-    screen_h = term_h + STATUS_BAR_HEIGHT
+    term_y = TOP_MENU_HEIGHT
+    screen_h = TOP_MENU_HEIGHT + term_h + STATUS_BAR_HEIGHT
     surface = pygame.display.set_mode((screen_w, screen_h))
     clock = pygame.time.Clock()
 
     scroll_offset = 0
+    prompt_mode = None  # None, "SEND", "RECEIVE"
+    prompt_text = ""
+    active_menu_idx = None
+    toast_text = None
+    toast_expires = 0.0
     running = True
+
+    def _trigger_action(action: str):
+        nonlocal prompt_mode, prompt_text, scroll_offset, running, active_menu_idx
+        active_menu_idx = None
+        if action == "PROMPT_SEND":
+            prompt_mode = "SEND"
+            prompt_text = ""
+        elif action == "PROMPT_RECEIVE":
+            prompt_mode = "RECEIVE"
+            prompt_text = ""
+        elif action == "RESET_SCROLLBACK":
+            scroll_offset = 0
+        elif action == "QUIT":
+            running = False
+
+    def _on_xmodem_done(res: dict):
+        nonlocal toast_text, toast_expires
+        import time
+        if res.get("ok"):
+            count = res.get("bytes", res.get("blocks", 0))
+            unit = "bytes" if "bytes" in res else "blocks"
+            toast_text = f"XMODEM Success: Transferred {count} {unit}"
+        else:
+            toast_text = f"XMODEM Error: {res.get('error', 'Failed')}"
+        toast_expires = time.time() + 4.0
+
     while running:
+        import time
+        mouse_pos = pygame.mouse.get_pos()
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -111,12 +172,79 @@ def run(link, title: str = "RC2014 Bridge"):
                     scroll_offset += 3 * event.y
                 elif event.y < 0:
                     scroll_offset = max(0, scroll_offset + 3 * event.y)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+                # Handle dropdown selection if a dropdown menu is open
+                clicked_menu_item = False
+                if active_menu_idx is not None:
+                    # calculate dropdown box
+                    top_x = 8
+                    for idx in range(active_menu_idx):
+                        header_w = menu_font.size(f"  {MENU_DATA[idx]['title']}  ")[0]
+                        top_x += header_w + 4
+
+                    items = MENU_DATA[active_menu_idx]["items"]
+                    max_item_w = max(menu_font.size(f" {it['label']} ")[0] for it in items) + 16
+                    dd_h = len(items) * 22 + 6
+                    dd_rect = pygame.Rect(top_x, TOP_MENU_HEIGHT, max_item_w, dd_h)
+
+                    if dd_rect.collidepoint(mx, my):
+                        item_idx = (my - TOP_MENU_HEIGHT - 3) // 22
+                        if 0 <= item_idx < len(items):
+                            _trigger_action(items[item_idx]["action"])
+                            clicked_menu_item = True
+
+                if not clicked_menu_item:
+                    # Check click on top menu header bar
+                    if my < TOP_MENU_HEIGHT:
+                        top_x = 8
+                        for idx, menu in enumerate(MENU_DATA):
+                            header_w = menu_font.size(f"  {menu['title']}  ")[0]
+                            if top_x <= mx <= top_x + header_w:
+                                active_menu_idx = idx if active_menu_idx != idx else None
+                                break
+                            top_x += header_w + 4
+                    else:
+                        active_menu_idx = None
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 4:  # Wheel up
                     scroll_offset += 3
                 elif event.button == 5:  # Wheel down
                     scroll_offset = max(0, scroll_offset - 3)
             elif event.type == pygame.KEYDOWN:
+                # ------------------------------------------------------
+                # Handle Interactive Prompt Keyboard Input
+                # ------------------------------------------------------
+                if prompt_mode is not None:
+                    if event.key == pygame.K_ESCAPE:
+                        prompt_mode = None
+                        prompt_text = ""
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        target_path = prompt_text.strip()
+                        current_mode = prompt_mode
+                        prompt_mode = None
+                        prompt_text = ""
+                        if target_path:
+                            if current_mode == "SEND":
+                                link.xmodem_send_async(target_path, callback=_on_xmodem_done)
+                            elif current_mode == "RECEIVE":
+                                link.xmodem_receive_async(target_path, callback=_on_xmodem_done)
+                    elif event.key == pygame.K_BACKSPACE:
+                        prompt_text = prompt_text[:-1]
+                    elif event.unicode:
+                        prompt_text += event.unicode
+                    continue
+
+                # ------------------------------------------------------
+                # Global Keyboard Shortcuts
+                # ------------------------------------------------------
+                if event.key == pygame.K_F2:
+                    _trigger_action("PROMPT_SEND")
+                    continue
+                elif event.key == pygame.K_F3:
+                    _trigger_action("PROMPT_RECEIVE")
+                    continue
+
                 if event.mod & pygame.KMOD_SHIFT:
                     if event.key == pygame.K_PAGEUP:
                         scroll_offset += 10
@@ -168,7 +296,7 @@ def run(link, title: str = "RC2014 Bridge"):
 
                     img = font.render(text, False, fg_rgb, bg_rgb)
                     x_pos = col_offset * cell_w
-                    y_pos = row * cell_h
+                    y_pos = term_y + row * cell_h
                     surface.blit(img, (x_pos, y_pos))
 
                     if underscore:
@@ -180,32 +308,115 @@ def run(link, title: str = "RC2014 Bridge"):
             for row, line in enumerate(state["lines"]):
                 if line.strip():
                     img = font.render(line, False, FG, BG)
-                    surface.blit(img, (0, row * cell_h))
+                    surface.blit(img, (0, term_y + row * cell_h))
 
         if scroll_offset == 0 and (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
             cx, cy = state["cursor"]["x"], state["cursor"]["y"]
-            rect = pygame.Rect(cx * cell_w, cy * cell_h, cell_w, cell_h)
+            rect = pygame.Rect(cx * cell_w, term_y + cy * cell_h, cell_w, cell_h)
             pygame.draw.rect(surface, CURSOR, rect, width=2)
 
         if scroll_offset > 0:
             badge_text = f" SCROLLBACK: -{scroll_offset} lines (Shift+End to exit) "
             badge_img = font.render(badge_text, True, (255, 255, 255), (140, 30, 30))
-            badge_rect = badge_img.get_rect(topright=(screen_w - 5, 5))
+            badge_rect = badge_img.get_rect(topright=(screen_w - 5, term_y + 5))
             surface.blit(badge_img, badge_rect)
 
         # --------------------------------------------------------------
-        # 2. Render Status Bar Panel
+        # 2. Render Top Menu Header Bar
         # --------------------------------------------------------------
-        bar_rect = pygame.Rect(0, term_h, screen_w, STATUS_BAR_HEIGHT)
+        top_bar_rect = pygame.Rect(0, 0, screen_w, TOP_MENU_HEIGHT)
+        pygame.draw.rect(surface, (28, 33, 40), top_bar_rect)
+        pygame.draw.line(surface, (55, 65, 80), (0, TOP_MENU_HEIGHT - 1), (screen_w, TOP_MENU_HEIGHT - 1), width=1)
+
+        cur_x = 8
+        mx, my = mouse_pos
+        for idx, menu in enumerate(MENU_DATA):
+            title_text = f"  {menu['title']}  "
+            header_w, header_h = menu_font.size(title_text)
+            is_hover = (cur_x <= mx <= cur_x + header_w and my < TOP_MENU_HEIGHT)
+            is_active = (active_menu_idx == idx)
+
+            if is_active or is_hover:
+                pygame.draw.rect(surface, (45, 95, 165), (cur_x, 2, header_w, TOP_MENU_HEIGHT - 4))
+                title_img = menu_font.render(title_text, True, (255, 255, 255))
+            else:
+                title_img = menu_font.render(title_text, True, (190, 205, 220))
+
+            surface.blit(title_img, (cur_x, 4))
+            cur_x += header_w + 4
+
+        # --------------------------------------------------------------
+        # 3. Render Open Dropdown Menu Overlay
+        # --------------------------------------------------------------
+        if active_menu_idx is not None:
+            top_x = 8
+            for idx in range(active_menu_idx):
+                header_w = menu_font.size(f"  {MENU_DATA[idx]['title']}  ")[0]
+                top_x += header_w + 4
+
+            items = MENU_DATA[active_menu_idx]["items"]
+            max_item_w = max(menu_font.size(f" {it['label']} ")[0] for it in items) + 16
+            dd_h = len(items) * 22 + 6
+            dd_rect = pygame.Rect(top_x, TOP_MENU_HEIGHT, max_item_w, dd_h)
+
+            pygame.draw.rect(surface, (24, 28, 34), dd_rect)
+            pygame.draw.rect(surface, (60, 75, 95), dd_rect, width=1)
+
+            for i_idx, item in enumerate(items):
+                item_y = TOP_MENU_HEIGHT + 3 + i_idx * 22
+                item_rect = pygame.Rect(top_x + 1, item_y, max_item_w - 2, 22)
+                item_hover = item_rect.collidepoint(mx, my)
+
+                if item_hover:
+                    pygame.draw.rect(surface, (45, 95, 165), item_rect)
+                    lbl_img = menu_font.render(f" {item['label']}", True, (255, 255, 255))
+                else:
+                    lbl_img = menu_font.render(f" {item['label']}", True, (200, 215, 230))
+                surface.blit(lbl_img, (top_x + 6, item_y + 3))
+
+        # --------------------------------------------------------------
+        # 4. Render Interactive Path Prompt Banner (if active)
+        # --------------------------------------------------------------
+        if prompt_mode is not None:
+            prompt_h = 32
+            prompt_rect = pygame.Rect(0, term_y, screen_w, prompt_h)
+            banner_bg = (180, 100, 15) if prompt_mode == "SEND" else (20, 100, 160)
+            pygame.draw.rect(surface, banner_bg, prompt_rect)
+            pygame.draw.line(surface, (255, 255, 255), (0, term_y + prompt_h - 1), (screen_w, term_y + prompt_h - 1), width=1)
+
+            hdr_text = f"XMODEM {prompt_mode} PATH:"
+            hdr_img = status_font.render(hdr_text, True, (255, 255, 200))
+            surface.blit(hdr_img, (10, term_y + 8))
+
+            input_text = prompt_text + "_"
+            input_img = font.render(input_text, True, (255, 255, 255))
+            surface.blit(input_img, (10 + hdr_img.get_width() + 10, term_y + 6))
+
+            hint_img = status_font.render("(Enter: Start | Esc: Cancel)", True, (240, 240, 240))
+            surface.blit(hint_img, (screen_w - hint_img.get_width() - 10, term_y + 8))
+
+        # --------------------------------------------------------------
+        # 5. Render Notification Toast (if active)
+        # --------------------------------------------------------------
+        if toast_text and time.time() < toast_expires:
+            toast_img = status_font.render(f" {toast_text} ", True, (255, 255, 255), (20, 120, 60) if "Success" in toast_text else (160, 30, 30))
+            toast_rect = toast_img.get_rect(topright=(screen_w - 10, term_y + 10))
+            surface.blit(toast_img, toast_rect)
+
+        # --------------------------------------------------------------
+        # 6. Render Status Bar Panel
+        # --------------------------------------------------------------
+        status_y = term_y + term_h
+        bar_rect = pygame.Rect(0, status_y, screen_w, STATUS_BAR_HEIGHT)
         pygame.draw.rect(surface, (22, 26, 32), bar_rect)
-        pygame.draw.line(surface, (55, 65, 80), (0, term_h), (screen_w, term_h), width=1)
+        pygame.draw.line(surface, (55, 65, 80), (0, status_y), (screen_w, status_y), width=1)
 
         # Left Info: Port & Baud
         port_name = state.get("port", "/dev/ttyUSB0")
         baud_rate = state.get("baud", 115200)
         conn_text = f"{port_name} @ {baud_rate} 8N1"
         conn_img = status_font.render(conn_text, True, (170, 185, 200))
-        surface.blit(conn_img, (8, term_h + 6))
+        surface.blit(conn_img, (8, status_y + 6))
 
         # Mode Badge
         mode = state.get("mode", "terminal").upper()
@@ -225,7 +436,7 @@ def run(link, title: str = "RC2014 Bridge"):
 
         badge_txt_img = status_font.render(f" {mode_label} ", True, badge_fg, badge_bg)
         badge_x = 8 + conn_img.get_width() + 12
-        surface.blit(badge_txt_img, (badge_x, term_h + 5))
+        surface.blit(badge_txt_img, (badge_x, status_y + 5))
 
         # Middle: XMODEM Progress Bar (if active)
         if xp.get("active"):
@@ -236,7 +447,7 @@ def run(link, title: str = "RC2014 Bridge"):
 
             pbar_w, pbar_h = 240, 16
             pbar_x = screen_w // 2 - pbar_w // 2
-            pbar_y = term_h + 6
+            pbar_y = status_y + 6
 
             pygame.draw.rect(surface, (40, 48, 58), (pbar_x, pbar_y, pbar_w, pbar_h))
             if pct > 0:
@@ -246,7 +457,7 @@ def run(link, title: str = "RC2014 Bridge"):
 
             prog_str = f"{filename}: {int(pct)}% ({cur_b}/{tot_b})" if tot_b > 0 else f"{filename}: {cur_b} blks"
             prog_img = status_font.render(prog_str, True, (255, 255, 255))
-            prog_rect = prog_img.get_rect(center=(screen_w // 2, term_h + 14))
+            prog_rect = prog_img.get_rect(center=(screen_w // 2, status_y + 14))
             surface.blit(prog_img, prog_rect)
 
         # Right: RX / TX Indicators
@@ -264,13 +475,14 @@ def run(link, title: str = "RC2014 Bridge"):
         rx_x = screen_w - rx_img.get_width() - 8
         tx_x = rx_x - tx_img.get_width() - 6
 
-        surface.blit(tx_img, (tx_x, term_h + 5))
-        surface.blit(rx_img, (rx_x, term_h + 5))
+        surface.blit(tx_img, (tx_x, status_y + 5))
+        surface.blit(rx_img, (rx_x, status_y + 5))
 
         pygame.display.flip()
         clock.tick(30)
 
     pygame.quit()
+
 
 
 
