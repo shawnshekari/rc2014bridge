@@ -37,11 +37,18 @@ def main():
                                     "reboot", "scan_drives", "get_hardware_info"])
     p.add_argument("arg", nargs="?", help="text / pattern / path, depending on cmd")
     p.add_argument("--timeout", type=float, default=10.0)
+    p.add_argument("--max-lines", type=int, default=None, help="max lines to fetch (0 for all scrollback)")
+    p.add_argument("--history", action="store_true", help="fetch all scrollback history lines")
     args = p.parse_args()
 
     req = {"cmd": args.cmd}
     if args.cmd == "send_text":
         req["text"] = args.arg.encode().decode("unicode_escape")
+    elif args.cmd == "get_screen":
+        if args.history:
+            req["max_lines"] = 0
+        elif args.max_lines is not None:
+            req["max_lines"] = args.max_lines
     elif args.cmd == "wait_for":
         req["pattern"] = args.arg
         req["timeout"] = args.timeout

@@ -475,58 +475,101 @@ class SerialLink:
         else:
             self._write_raw(data)
 
-    def get_screen(self, scroll_offset: int = 0) -> dict:
+    def get_screen(self, scroll_offset: int = 0, max_lines: int = None) -> dict:
         now = time.time()
         rx_active = (now - self._last_rx_time) < 0.250
         tx_active = (now - self._last_tx_time) < 0.250
         with self._screen_lock:
             history_count = len(self._screen.history.top)
-            offset = max(0, min(scroll_offset, history_count))
             cx, cy = self._screen.cursor.x, self._screen.cursor.y
-            runs = []
-            lines = []
-            for r in range(self.rows):
-                idx = r - offset
-                if idx < 0:
-                    if abs(idx) <= history_count:
-                        row_cells = self._screen.history.top[idx]
-                    else:
-                        row_cells = self._screen.buffer[0]
-                else:
-                    row_cells = self._screen.buffer[idx]
 
-                row_runs = []
-                current_run = None
-                line_chars = []
-                for c in range(self.cols):
-                    char = row_cells[c]
-                    line_chars.append(char.data)
-                    style = (char.fg, char.bg, char.bold, char.underscore, char.reverse)
-                    if current_run is None:
-                        current_run = {
-                            "text": char.data,
-                            "fg": char.fg,
-                            "bg": char.bg,
-                            "bold": char.bold,
-                            "underscore": char.underscore,
-                            "reverse": char.reverse,
-                        }
-                    elif (current_run["fg"], current_run["bg"], current_run["bold"], current_run["underscore"], current_run["reverse"]) == style:
-                        current_run["text"] += char.data
-                    else:
+            if max_lines is not None:
+                all_cells = list(self._screen.history.top) + [self._screen.buffer[r] for r in range(self.rows)]
+                if max_lines > 0 and len(all_cells) > max_lines:
+                    all_cells = all_cells[-max_lines:]
+
+                runs = []
+                lines = []
+                for row_cells in all_cells:
+                    row_runs = []
+                    current_run = None
+                    line_chars = []
+                    for c in range(self.cols):
+                        char = row_cells[c]
+                        line_chars.append(char.data)
+                        style = (char.fg, char.bg, char.bold, char.underscore, char.reverse)
+                        if current_run is None:
+                            current_run = {
+                                "text": char.data,
+                                "fg": char.fg,
+                                "bg": char.bg,
+                                "bold": char.bold,
+                                "underscore": char.underscore,
+                                "reverse": char.reverse,
+                            }
+                        elif (current_run["fg"], current_run["bg"], current_run["bold"], current_run["underscore"], current_run["reverse"]) == style:
+                            current_run["text"] += char.data
+                        else:
+                            row_runs.append(current_run)
+                            current_run = {
+                                "text": char.data,
+                                "fg": char.fg,
+                                "bg": char.bg,
+                                "bold": char.bold,
+                                "underscore": char.underscore,
+                                "reverse": char.reverse,
+                            }
+                    if current_run is not None:
                         row_runs.append(current_run)
-                        current_run = {
-                            "text": char.data,
-                            "fg": char.fg,
-                            "bg": char.bg,
-                            "bold": char.bold,
-                            "underscore": char.underscore,
-                            "reverse": char.reverse,
-                        }
-                if current_run is not None:
-                    row_runs.append(current_run)
-                runs.append(row_runs)
-                lines.append("".join(line_chars))
+                    runs.append(row_runs)
+                    lines.append("".join(line_chars))
+                offset = 0
+            else:
+                offset = max(0, min(scroll_offset, history_count))
+                runs = []
+                lines = []
+                for r in range(self.rows):
+                    idx = r - offset
+                    if idx < 0:
+                        if abs(idx) <= history_count:
+                            row_cells = self._screen.history.top[idx]
+                        else:
+                            row_cells = self._screen.buffer[0]
+                    else:
+                        row_cells = self._screen.buffer[idx]
+
+                    row_runs = []
+                    current_run = None
+                    line_chars = []
+                    for c in range(self.cols):
+                        char = row_cells[c]
+                        line_chars.append(char.data)
+                        style = (char.fg, char.bg, char.bold, char.underscore, char.reverse)
+                        if current_run is None:
+                            current_run = {
+                                "text": char.data,
+                                "fg": char.fg,
+                                "bg": char.bg,
+                                "bold": char.bold,
+                                "underscore": char.underscore,
+                                "reverse": char.reverse,
+                            }
+                        elif (current_run["fg"], current_run["bg"], current_run["bold"], current_run["underscore"], current_run["reverse"]) == style:
+                            current_run["text"] += char.data
+                        else:
+                            row_runs.append(current_run)
+                            current_run = {
+                                "text": char.data,
+                                "fg": char.fg,
+                                "bg": char.bg,
+                                "bold": char.bold,
+                                "underscore": char.underscore,
+                                "reverse": char.reverse,
+                            }
+                    if current_run is not None:
+                        row_runs.append(current_run)
+                    runs.append(row_runs)
+                    lines.append("".join(line_chars))
 
         with self._mode_lock:
             current_mode = self._mode
