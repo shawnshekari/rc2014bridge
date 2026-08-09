@@ -88,16 +88,19 @@ class McpServer:
         @self.mcp.resource("rc2014://docs/hardware-overview")
         def get_hardware_overview_doc() -> str:
             """Detailed documentation on RC2014 Z80 hardware architecture, memory map, and serial communications."""
+            logger.info("MCP Resource requested: rc2014://docs/hardware-overview")
             return HARDWARE_OVERVIEW_DOC
 
         @self.mcp.resource("rc2014://docs/cpm-guide")
         def get_cpm_guide_doc() -> str:
             """Quick reference manual for CP/M 2.2 and ZSDOS commands, utilities, and filename conventions."""
+            logger.info("MCP Resource requested: rc2014://docs/cpm-guide")
             return CPM_GUIDE_DOC
 
         @self.mcp.resource("rc2014://system/hardware-info")
         def get_hardware_info_resource() -> str:
             """Live JSON snapshot of connected RC2014 hardware specs, ZSDOS specs, and drive inventory."""
+            logger.info("MCP Resource requested: rc2014://system/hardware-info")
             info = getattr(self.link, "hardware_info", {})
             return json.dumps(info, indent=2)
 
@@ -105,6 +108,7 @@ class McpServer:
         @self.mcp.prompt("rc2014_assistant_instructions")
         def rc2014_assistant_prompt() -> str:
             """Prompt template configuring the LLM as an expert RC2014 retro-computing assistant."""
+            logger.info("MCP Prompt requested: rc2014_assistant_instructions")
             return (
                 "You are an expert retro-computing assistant operating an RC2014 Z80 vintage computer via the rc2014bridge MCP toolset.\n"
                 "Always format CP/M filenames in uppercase 8.3 format. Use `rc2014_send_text` to execute commands, "
@@ -117,12 +121,14 @@ class McpServer:
         @self.mcp.tool()
         def rc2014_send_text(text: str) -> str:
             """Send a text string or command to the RC2014 serial terminal (e.g. 'DIR A:\\r', 'STAT\\r'). Automatically paced with 15ms delays."""
+            logger.info("MCP Tool called: rc2014_send_text(text=%r)", text)
             link.send_text(text)
             return f"Sent text to RC2014: {text!r}"
 
         @self.mcp.tool()
         def rc2014_get_screen(max_lines: int = 0) -> str:
             """Get rendered 80x48 screen lines and terminal scrollback history. Pass max_lines=0 for all history lines."""
+            logger.info("MCP Tool called: rc2014_get_screen(max_lines=%d)", max_lines)
             sc = link.get_screen(max_lines=max_lines)
             lines = sc.get("lines", [])
             return "\n".join(lines)
@@ -130,32 +136,38 @@ class McpServer:
         @self.mcp.tool()
         def rc2014_wait_for(pattern: str, timeout: float = 10.0) -> dict:
             """Block until a regex pattern (e.g. 'A>', 'HBIOS>', 'Boot:') appears on the screen within timeout seconds."""
+            logger.info("MCP Tool called: rc2014_wait_for(pattern=%r, timeout=%s)", pattern, timeout)
             return link.wait_for(pattern, timeout=timeout)
 
         @self.mcp.tool()
         def rc2014_scan_drives() -> dict:
             """Scan CP/M drives A: through J:, query STAT free space capacity, and classify disk volume purposes."""
+            logger.info("MCP Tool called: rc2014_scan_drives()")
             return link.scan_drives()
 
         @self.mcp.tool()
         def rc2014_get_hardware_info() -> dict:
             """Get RomWBW version, Z80 CPU clock speed, MMU RAM/ROM sizes, SIO ports, ZSDOS specs, and drive inventory."""
+            logger.info("MCP Tool called: rc2014_get_hardware_info()")
             return getattr(link, "hardware_info", {})
 
         @self.mcp.tool()
         def rc2014_reboot() -> str:
             """Send hardware reboot command to the RC2014 (C:REBOOT /C in CP/M mode, R in HBIOS mode)."""
+            logger.info("MCP Tool called: rc2014_reboot()")
             link.reboot()
             return "Reboot command issued to RC2014"
 
         @self.mcp.tool()
         def rc2014_xmodem_send(path: str) -> dict:
             """Send a local file to the RC2014 using XMODEM CRC protocol."""
+            logger.info("MCP Tool called: rc2014_xmodem_send(path=%r)", path)
             return link.xmodem_send(path)
 
         @self.mcp.tool()
         def rc2014_xmodem_receive(path: str) -> dict:
             """Receive a file from the RC2014 using XMODEM CRC protocol."""
+            logger.info("MCP Tool called: rc2014_xmodem_receive(path=%r)", path)
             return link.xmodem_receive(path)
 
     def start(self):
@@ -168,7 +180,7 @@ class McpServer:
                     allowed_origins=["*"],
                 )
                 sse_app = self.mcp.sse_app(host=self.host, transport_security=sec_settings)
-                uvicorn.run(sse_app, host=self.host, port=self.port, log_level="warning")
+                uvicorn.run(sse_app, host=self.host, port=self.port, log_level="info")
             except Exception as e:
                 logger.exception("MCP Server error: %s", e)
 
