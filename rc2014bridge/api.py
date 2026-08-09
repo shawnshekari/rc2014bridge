@@ -80,6 +80,8 @@ class ApiServer:
         if cmd == "reboot":
             self.link.reboot()
             return {"ok": True}
+        if cmd == "scan_drives":
+            return self.link.scan_drives()
         if cmd == "get_hardware_info":
             return {"ok": True, "info": getattr(self.link, "hardware_info", {})}
         return {"ok": False, "error": f"unknown cmd {cmd!r}"}

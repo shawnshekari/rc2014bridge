@@ -92,6 +92,65 @@ def _parse_boot_banner(text: str) -> dict:
                 info["devices"].append(line_s)
     return info
 
+def _parse_zsdos_banner(text: str) -> dict:
+    info = {}
+    m = re.search(r"ZSDOS\s+(v[0-9\.\w-]+(?:,\s*[0-9\.\w]+\s*TPA)?)", text, re.IGNORECASE)
+    if m:
+        info["zsdos_version"] = m.group(0)
+
+    m = re.search(r"CBIOS\s+(v[0-9\.\w-]+(?:\s*\[\w+\])?)", text, re.IGNORECASE)
+    if m:
+        info["cbios_version"] = m.group(0)
+
+    m = re.search(r"(\d+(?:\.\d+)?K\s+TPA)", text, re.IGNORECASE)
+    if m:
+        info["tpa"] = m.group(1)
+
+    drives = {}
+    for line in text.splitlines():
+        line_s = line.strip()
+        dm = re.match(r"^([A-J]):=([A-Z0-9]+:\d+)", line_s)
+        if dm:
+            drives[dm.group(1)] = dm.group(2)
+    if drives:
+        info["drive_mappings"] = drives
+    return info
+
+
+def _parse_cpm_dir_output(text: str) -> list[str]:
+    files = []
+    for line in text.splitlines():
+        line_clean = re.sub(r"^[A-P]:", "", line.strip())
+        parts = line_clean.split(":")
+        for part in parts:
+            p_str = part.strip()
+            m = re.match(r"^([A-Z0-9_\$]{1,8})\s+([A-Z0-9_\$]{1,3})$", p_str)
+            if m:
+                fname = f"{m.group(1)}.{m.group(2)}"
+                if fname not in files:
+                    files.append(fname)
+    return files
+
+
+def _classify_drive_purpose(drive: str, files: list[str], device_map: str = "") -> str:
+    files_upper = [f.upper() for f in files]
+    dev_upper = device_map.upper()
+
+    if "MD1" in dev_upper or ("XM.COM" in files_upper and "FLASH.COM" in files_upper):
+        return "ROM System Disk (Read-Only)"
+    if "MD0" in dev_upper:
+        return "RAM Volatile Disk (MD0)"
+    if any(f in files_upper for f in ["ZPATH.COM", "STAT.COM", "PIP.COM", "SUBMIT.COM", "CCP.COM"]):
+        return "ZSDOS / CP/M System Boot Disk"
+
+    code_exts = (".Z80", ".PAS", ".C", ".BAS", ".ASM", ".HEX", ".TXT", ".MAC", ".SUB", ".PRN")
+    has_code = any(any(f.endswith(ext) for ext in code_exts) for f in files_upper)
+    if has_code or (files_upper and not any(f.endswith(".COM") for f in files_upper)):
+        return "User Programming & Source Code"
+    if files_upper:
+        return "General Application / Data Volume"
+    return "Empty / Unformatted Volume"
+
 
 class SerialLink:
     def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 24, hw_info_file: str = "hardware_info.json"):
@@ -195,6 +254,55 @@ class SerialLink:
             time.sleep(0.4)
             self._write_raw(b"R\r")
 
+    def scan_drives_async(self, callback=None):
+        def _worker():
+            try:
+                res = self.scan_drives()
+                if callback:
+                    callback(res)
+            except Exception as e:
+                logger.exception("Drive scan failed: %s", e)
+                if callback:
+                    callback({"ok": False, "error": str(e)})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def scan_drives(self) -> dict:
+        logger.info("Starting CP/M drive scan...")
+        screen = self.get_screen()
+        lines = [l.strip() for l in screen.get("lines", []) if l.strip()]
+        last_line = lines[-1] if lines else ""
+
+        if not re.search(r"^[A-P]>|^[0-9]+[A-P]>", last_line):
+            return {"ok": False, "error": "System is not at CP/M prompt (A> .. P>)"}
+
+        mapped = self.hardware_info.get("drive_mappings", {})
+        drives_to_scan = list(mapped.keys()) if mapped else ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+
+        results = []
+        for drv in drives_to_scan:
+            dev_map = mapped.get(drv, "")
+            self.send_text(f"DIR {drv}:\r")
+            time.sleep(0.6)
+            sc = self.get_screen()
+            sc_text = "\n".join(sc.get("lines", []))
+            files = _parse_cpm_dir_output(sc_text)
+            purpose = _classify_drive_purpose(f"{drv}:", files, dev_map)
+            drv_info = {
+                "drive": f"{drv}:",
+                "device": dev_map or "Unknown",
+                "files_count": len(files),
+                "files_sample": files[:6],
+                "purpose": purpose,
+            }
+            results.append(drv_info)
+
+        self.hardware_info["drives"] = results
+        self.hardware_info["last_scan_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._save_hardware_info()
+        logger.info("Drive scan completed. %d drives scanned.", len(results))
+        return {"ok": True, "drives": results}
+
     def close(self):
         self._stop.set()
         self._reader.join(timeout=1.0)
@@ -209,6 +317,12 @@ class SerialLink:
             parsed = _parse_boot_banner(self._boot_buffer)
             if parsed.get("version") or parsed.get("devices"):
                 self.hardware_info.update({k: v for k, v in parsed.items() if v})
+                self._save_hardware_info()
+
+        if "ZSDOS" in text or "CBIOS" in text or "Configuring Drives" in text:
+            parsed_z = _parse_zsdos_banner(self._boot_buffer)
+            if parsed_z.get("zsdos_version") or parsed_z.get("drive_mappings"):
+                self.hardware_info.update({k: v for k, v in parsed_z.items() if v})
                 self._save_hardware_info()
 
         for line in text.splitlines():
