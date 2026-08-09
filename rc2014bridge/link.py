@@ -117,6 +117,14 @@ def _parse_zsdos_banner(text: str) -> dict:
     return info
 
 
+def _extract_drive_dir_block(full_text: str, drive_letter: str) -> str:
+    pattern = rf"[A-P]>DIR\s+{drive_letter}:(.*?)(?=[A-P]>|\Z)"
+    m = re.search(pattern, full_text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def _parse_cpm_dir_output(text: str) -> list[str]:
     files = []
     ignored = {"NO", "FILE", "DIR", "BYTES", "FREE", "USAGE", "KB", "DRIVE", "UNIT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
@@ -261,6 +269,18 @@ class SerialLink:
             time.sleep(0.4)
             self._write_raw(b"R\r")
 
+    def _get_full_screen_history_text(self) -> str:
+        lines = []
+        with self._screen_lock:
+            for row_cells in self._screen.history.top:
+                line_str = "".join(char.data for char in row_cells.values()).rstrip()
+                lines.append(line_str)
+            for r in range(self.rows):
+                row_cells = self._screen.buffer[r]
+                line_str = "".join(char.data for char in row_cells.values()).rstrip()
+                lines.append(line_str)
+        return "\n".join(lines)
+
     def scan_drives_async(self, callback=None):
         def _worker():
             try:
@@ -290,24 +310,23 @@ class SerialLink:
         for drv in drives_to_scan:
             dev_map = mapped.get(drv, "")
             time.sleep(0.15)
-            sc_before = self.get_screen()
-            sc_before_text = "\n".join(sc_before.get("lines", []))
 
             self.send_text(f"DIR {drv}:\r")
 
             deadline = time.time() + 3.0
-            sc_text = ""
+            sc = {}
             while time.time() < deadline:
                 time.sleep(0.15)
                 sc = self.get_screen()
                 sc_lines = [l.strip() for l in sc.get("lines", []) if l.strip()]
-                sc_text = "\n".join(sc.get("lines", []))
                 if sc_lines and re.search(r"^[A-P]>|^[0-9]+[A-P]>", sc_lines[-1]):
                     break
 
-            new_text = sc_text[len(sc_before_text):] if len(sc_text) >= len(sc_before_text) else sc_text
-            files = _parse_cpm_dir_output(new_text if new_text.strip() else sc_text)
+            full_history_text = self._get_full_screen_history_text()
+            dir_block = _extract_drive_dir_block(full_history_text, drv)
+            files = _parse_cpm_dir_output(dir_block) if dir_block else []
             purpose = _classify_drive_purpose(f"{drv}:", files, dev_map)
+
             drv_info = {
                 "drive": f"{drv}:",
                 "device": dev_map or "Unknown",
