@@ -33,7 +33,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sock", default=DEFAULT_SOCK)
     p.add_argument("cmd", choices=["send_text", "get_screen", "wait_for",
-                                    "xmodem_send", "xmodem_receive"])
+                                    "xmodem_send", "xmodem_receive",
+                                    "reboot", "get_hardware_info"])
     p.add_argument("arg", nargs="?", help="text / pattern / path, depending on cmd")
     p.add_argument("--timeout", type=float, default=10.0)
     args = p.parse_args()

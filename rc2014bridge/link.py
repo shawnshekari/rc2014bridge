@@ -167,11 +167,11 @@ class SerialLink:
         with self._mode_lock:
             self._mode = "terminal"
         if self._system_state == "cpm":
-            self._write_raw(b"REBOOT\r")
+            self._write_raw(b"C:REBOOT /C\r")
         elif self._system_state in ("hbios", "flash_util"):
             self._write_raw(b"R\r")
         else:
-            self._write_raw(b"REBOOT\r")
+            self._write_raw(b"C:REBOOT /C\r")
             time.sleep(0.4)
             self._write_raw(b"\rR\r")
 
