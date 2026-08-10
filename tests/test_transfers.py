@@ -9,6 +9,8 @@ encoded here once instead.
 
 import os
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -311,6 +313,45 @@ class TestTextFiles(TransferTestCase):
         self.respond({b"TYPE": b"\r\nNo file\r\nA>"})
         res = self.link.read_text_file("B:MISSING.TXT")
         self.assertFalse(res["ok"])
+
+    def test_read_advances_a_silent_pager(self):
+        """This ZSDOS build's console driver pages TYPE by CRT height and
+        blocks for a keystroke between pages with no visible marker at all -
+        not even "-- more --". Confirmed against real hardware: a file just
+        past one page returned only page one, marked ok/not-timed-out, with
+        no hint anything was missing. read_text_file must notice the wire
+        went quiet without a prompt in sight and nudge it, same as it did on
+        the real board."""
+        page_one = b"\r\n" + b"a" * 40 + b"\r\n"
+        page_two = b"b" * 40 + b"\r\nA>"
+        nudged = threading.Event()
+
+        def _responder(line: bytes):
+            self.commands.append(line)
+            if b"TYPE" not in line:
+                return None
+            checkpoint = len(self.fake.written)
+
+            def _wait_for_nudge():
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if len(self.fake.written) > checkpoint:
+                        nudged.set()
+                        self.fake.feed(page_two)
+                        return
+                    time.sleep(0.01)
+
+            threading.Thread(target=_wait_for_nudge, daemon=True).start()
+            return page_one
+
+        self.fake.responder = _responder
+        res = self.link.read_text_file("B:BIG.TXT", timeout=10)
+
+        self.assertTrue(nudged.wait(timeout=1), "no nudge keystroke was ever sent")
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(res["timed_out"], res)
+        self.assertIn("a" * 40, res["content"])
+        self.assertIn("b" * 40, res["content"])
 
 
 if __name__ == "__main__":

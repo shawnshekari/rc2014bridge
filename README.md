@@ -333,6 +333,18 @@ All reproduced and confirmed against a physical RC2014, not guessed:
    later command. The failure path now sends XM's own documented cancel
    (Ctrl-X, pause, Ctrl-X — the `CAN CAN` pair) and confirms a prompt
    before returning, reporting `recovered` in the result.
+14. **`TYPE` pages its output with no visible marker at all.** This ZSDOS
+   build's console driver breaks output into CRT-height pages and blocks for
+   a keystroke between them — not `-- more --`, not anything; the wire just
+   goes quiet. That reads exactly like "still running" to a plain
+   wait-for-prompt, so `rc2014_read_text_file` used to return only the first
+   page, marked `ok` with no hint anything was missing. It now nudges the
+   board with a keystroke whenever output stalls without a prompt in sight
+   (`link._wait_for_idle_prompt`'s `nudge_after`), scoped to `read_text_file`
+   rather than `run_command` in general — a nudge sent into a genuinely
+   interactive program (`MBASIC`, `ED`) could do something unintended, but a
+   stray keystroke to a *paged* program is always safe: it either advances
+   the page or sits harmlessly in the input buffer until the next one does.
 
 ## Layout
 
