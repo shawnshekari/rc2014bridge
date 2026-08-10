@@ -1,8 +1,25 @@
 """
 Pygame front end: renders the SerialLink's pyte screen buffer and forwards
 local keystrokes to the port. This is the "human" half of the bridge -
-the model drives the same SerialLink concurrently through api.py.
+the model drives the same SerialLink concurrently through the MCP server.
+
+Keystrokes go straight to the port, deliberately bypassing the link's
+operation lock: a person must be able to type at any time, including Ctrl-X
+to cancel a transfer an agent started. Menu actions do take the lock, so the
+human can't kick off a drive scan in the middle of an agent's transfer.
+
+The one exception is during an XMODEM transfer, where ordinary typing is held
+back - it can only muddy the protocol stream, and it is never useful there.
+Ctrl-C and Ctrl-X still go through, because a human who cannot interrupt a
+stuck transfer has no way to rescue the machine. That is the whole reason this
+is a guard and not a lock.
 """
+
+import os
+import shutil
+import subprocess
+import threading
+import time
 
 import pygame
 
@@ -72,6 +89,39 @@ SPECIAL_KEYS = {
 }
 
 
+# Keys that must reach the board even mid-transfer: XM's cancel is Ctrl-X twice,
+# and Ctrl-C is the general escape from a running program. Never suppress these -
+# a human locked out of interrupting a stuck transfer has no way back.
+INTERRUPT_BYTES = frozenset({0x03, 0x18})  # Ctrl-C, Ctrl-X
+
+
+def operation_badge_label(mode_label: str, current_op: str) -> str | None:
+    """The operation badge text, or None when it would only repeat the mode badge.
+
+    During a transfer both are derived from the same state - the mode badge says
+    "XMODEM-SEND" and the operation is "XMODEM send" - so showing both just says
+    the same thing twice.
+    """
+    if not current_op:
+        return None
+
+    def key(text: str) -> str:
+        return "".join(ch for ch in text.upper() if ch.isalnum())
+
+    return None if key(current_op) == key(mode_label) else current_op.upper()
+
+
+def _allowed_during_transfer(data: bytes) -> bool:
+    """Whether a keystroke may go out while an XMODEM transfer owns the wire.
+
+    Ordinary typing lands between blocks, where a receiver ignores non-SOH bytes,
+    so it usually does no harm - but it is never *useful* mid-transfer, and it
+    muddies the protocol stream. Interrupts are the exception, and the reason
+    this is a guard rather than a block.
+    """
+    return len(data) == 1 and data[0] in INTERRUPT_BYTES
+
+
 def _key_to_bytes(event) -> bytes:
     if event.key in SPECIAL_KEYS:
         return SPECIAL_KEYS[event.key]
@@ -112,12 +162,6 @@ MENU_DATA = [
         ],
     },
 ]
-
-
-import os
-import shutil
-import subprocess
-import threading
 
 
 def _open_system_file_dialog(mode: str = "open", title: str = "Select File") -> str | None:
@@ -171,9 +215,23 @@ def _open_system_file_dialog(mode: str = "open", title: str = "Select File") -> 
     return None
 
 
+def window_title(link, base: str = "RC2014 Bridge") -> str:
+    """Name the machine in the title bar.
+
+    Just its RomWBW build identifier (e.g. "SCZ180_sc700_std") - that names the
+    board and CPU family in one token. The port and baud already live in the
+    status bar, so repeating them here would only crowd the title. Falls back to
+    the port until a boot banner has been captured.
+    """
+    hw = getattr(link, "hardware_info", {}) or {}
+    machine = hw.get("config") or hw.get("platform") or ""
+    return f"{base} - {machine}" if machine else f"{base} - {link.port}"
+
+
 def run(link, title: str = "RC2014 Bridge"):
     pygame.init()
-    pygame.display.set_caption(title)
+    caption = window_title(link, title)
+    pygame.display.set_caption(caption)
     font = pygame.font.SysFont("monospace", FONT_SIZE)
     menu_font = pygame.font.SysFont("monospace", 16, bold=True)
     status_font = pygame.font.SysFont("monospace", 16, bold=True)
@@ -195,26 +253,31 @@ def run(link, title: str = "RC2014 Bridge"):
     toast_expires = 0.0
     running = True
 
-    def _on_xmodem_done(res: dict):
+    def _show_toast(text: str, seconds: float = 4.0):
         nonlocal toast_text, toast_expires
-        import time
+        toast_text = text
+        toast_expires = time.time() + seconds
+
+    def _on_xmodem_done(res: dict):
         if res.get("ok"):
             count = res.get("bytes", res.get("blocks", 0))
             unit = "bytes" if "bytes" in res else "blocks"
-            toast_text = f"XMODEM Success: Transferred {count} {unit}"
+            _show_toast(f"XMODEM Success: Transferred {count} {unit}")
         else:
-            toast_text = f"XMODEM Error: {res.get('error', 'Failed')}"
-        toast_expires = time.time() + 4.0
+            _show_toast(f"XMODEM Error: {res.get('error', 'Failed')}")
 
     def _on_scan_done(res: dict):
-        nonlocal toast_text, toast_expires
-        import time
         if res.get("ok"):
-            d_count = len(res.get("drives", []))
-            toast_text = f"Scan Success: {d_count} drives cataloged"
+            _show_toast(f"Scan Success: {len(res.get('drives', []))} drives cataloged")
         else:
-            toast_text = f"Scan Error: {res.get('error', 'Failed')}"
-        toast_expires = time.time() + 4.0
+            _show_toast(f"Scan Error: {res.get('error', 'Failed')}")
+
+    def _do_reboot():
+        res = link.reboot() or {}
+        if res.get("ok"):
+            _show_toast("Reboot command sent to RC2014", 3.0)
+        else:
+            _show_toast(f"Reboot error: {res.get('error', 'Failed')}")
 
     def _trigger_action(action: str):
         nonlocal prompt_mode, prompt_text, scroll_offset, running, active_menu_idx, show_reboot_modal, show_hw_info_modal, toast_text, toast_expires
@@ -240,8 +303,7 @@ def run(link, title: str = "RC2014 Bridge"):
                     prompt_text = ""
             threading.Thread(target=_recv_worker, daemon=True).start()
         elif action == "SCAN_DRIVES":
-            toast_text = "Scanning RC2014 drives (A: .. J:)..."
-            toast_expires = time.time() + 6.0
+            _show_toast("Scanning RC2014 drives (A: .. J:)...", 6.0)
             link.scan_drives_async(callback=_on_scan_done)
         elif action == "CONFIRM_REBOOT":
             show_reboot_modal = True
@@ -253,7 +315,6 @@ def run(link, title: str = "RC2014 Bridge"):
             running = False
 
     while running:
-        import time
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
@@ -271,9 +332,7 @@ def run(link, title: str = "RC2014 Bridge"):
                     continue
                 if show_reboot_modal:
                     if my < TOP_MENU_HEIGHT + 36:
-                        link.reboot()
-                        toast_text = "Reboot command sent to RC2014"
-                        toast_expires = time.time() + 3.0
+                        _do_reboot()
                     show_reboot_modal = False
                     continue
 
@@ -320,9 +379,7 @@ def run(link, title: str = "RC2014 Bridge"):
 
                 if show_reboot_modal:
                     if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_y):
-                        link.reboot()
-                        toast_text = "Reboot command sent to RC2014"
-                        toast_expires = time.time() + 3.0
+                        _do_reboot()
                     show_reboot_modal = False
                     continue
 
@@ -362,8 +419,7 @@ def run(link, title: str = "RC2014 Bridge"):
                     if getattr(link, "_system_state", "cpm") == "cpm":
                         _trigger_action("SCAN_DRIVES")
                     else:
-                        toast_text = "Scan error: System must be in CP/M / ZSDOS mode"
-                        toast_expires = time.time() + 4.0
+                        _show_toast("Scan error: System must be in CP/M / ZSDOS mode")
                     continue
 
                 if event.mod & pygame.KMOD_SHIFT:
@@ -385,12 +441,29 @@ def run(link, title: str = "RC2014 Bridge"):
 
                 scroll_offset = 0
                 data = _key_to_bytes(event)
-                if data:
-                    link.send_text(data.decode("latin-1"), append_enter=False)
+                if not data:
+                    continue
+
+                # Mid-transfer, hold ordinary typing back - it can only muddy the
+                # protocol stream, and pressing Enter during an agent's command
+                # can even truncate what that agent reads. Interrupts still go
+                # through, so cancelling a stuck transfer is always possible.
+                if link.is_transferring() and not _allowed_during_transfer(data):
+                    _show_toast("Transfer in progress - keys held back (Ctrl-X twice to cancel)", 2.5)
+                    continue
+
+                link.send_text(data.decode("latin-1"), append_enter=False)
 
         state = link.get_screen(scroll_offset=scroll_offset)
         scroll_offset = state.get("scroll_offset", 0)
         surface.fill(BG)
+
+        # The banner arrives after startup, so the machine's identity only
+        # becomes known once it has booted - refresh the caption when it changes.
+        new_caption = window_title(link, title)
+        if new_caption != caption:
+            caption = new_caption
+            pygame.display.set_caption(caption)
 
         # --------------------------------------------------------------
         # 1. Render Terminal Viewport
@@ -554,13 +627,19 @@ def run(link, title: str = "RC2014 Bridge"):
             close_hint = status_font.render("[Esc/F5 to Close]", True, (180, 210, 240))
             surface.blit(close_hint, (box_x + box_w - close_hint.get_width() - 10, box_y + 6))
 
-            # Hardware & ZSDOS Specs
+            # Hardware & ZSDOS specs, as captured from the boot banner. Shown as
+            # "not captured" rather than a plausible-looking guess, so the panel
+            # never claims specs for a machine it hasn't actually read.
             y_curr = box_y + 38
+            not_captured = "not captured - reboot to capture"
+            os_line = hw_info.get("zsdos_version") or ""
+            if os_line and hw_info.get("tpa"):
+                os_line = f"{os_line} ({hw_info['tpa']})"
             lines_to_show = [
-                ("RomWBW Version:", hw_info.get("version", "v3.7.0 (RomWBW)")),
-                ("CPU Architecture:", hw_info.get("cpu", "RC2014 Z80 @ 7.372MHz")),
-                ("Memory / MMU:", hw_info.get("memory", "512KB ROM, 512KB RAM")),
-                ("ZSDOS / CBIOS:", f"{hw_info.get('zsdos_version', 'ZSDOS v1.1')} ({hw_info.get('tpa', '54K TPA')})"),
+                ("RomWBW Version:", hw_info.get("version") or not_captured),
+                ("CPU Architecture:", hw_info.get("cpu") or not_captured),
+                ("Memory / MMU:", hw_info.get("memory") or not_captured),
+                ("ZSDOS / CBIOS:", os_line or not_captured),
             ]
 
             for label, val in lines_to_show:
@@ -650,33 +729,23 @@ def run(link, title: str = "RC2014 Bridge"):
             badge_bg = (40, 50, 60)
             badge_fg = (180, 200, 220)
 
+        def _blit_middle(img, x):
+            surface.blit(img, (x, status_y + (STATUS_BAR_HEIGHT - img.get_height()) // 2))
+
         badge_txt_img = status_font.render(f" {mode_label} ", True, badge_fg, badge_bg)
         badge_x = 10 + conn_img.get_width() + 14
-        surface.blit(badge_txt_img, (badge_x, status_y + (STATUS_BAR_HEIGHT - badge_txt_img.get_height()) // 2))
+        _blit_middle(badge_txt_img, badge_x)
+        left_edge = badge_x + badge_txt_img.get_width()
 
-        # Middle: XMODEM Progress Bar (if active)
-        if xp.get("active"):
-            filename = xp.get("filename", "file")
-            cur_b = xp.get("current_block", 0)
-            tot_b = xp.get("total_blocks", 0)
-            pct = (cur_b / tot_b * 100.0) if tot_b > 0 else 0.0
+        # Active operation badge - so the human can see when the agent is driving
+        op_label = operation_badge_label(mode_label, state.get("current_op") or "")
+        if op_label:
+            op_img = status_font.render(f" {op_label} ", True, (255, 245, 210), (120, 85, 20))
+            _blit_middle(op_img, left_edge + 8)
+            left_edge += 8 + op_img.get_width()
 
-            pbar_w, pbar_h = 260, 20
-            pbar_x = screen_w // 2 - pbar_w // 2
-            pbar_y = status_y + (STATUS_BAR_HEIGHT - pbar_h) // 2
-
-            pygame.draw.rect(surface, (40, 48, 58), (pbar_x, pbar_y, pbar_w, pbar_h))
-            if pct > 0:
-                fill_w = int(pbar_w * (pct / 100.0))
-                pygame.draw.rect(surface, (0, 150, 220), (pbar_x, pbar_y, fill_w, pbar_h))
-            pygame.draw.rect(surface, (80, 95, 115), (pbar_x, pbar_y, pbar_w, pbar_h), width=1)
-
-            prog_str = f"{filename}: {int(pct)}% ({cur_b}/{tot_b})" if tot_b > 0 else f"{filename}: {cur_b} blks"
-            prog_img = status_font.render(prog_str, True, (255, 255, 255))
-            prog_rect = prog_img.get_rect(center=(screen_w // 2, status_y + STATUS_BAR_HEIGHT // 2))
-            surface.blit(prog_img, prog_rect)
-
-        # Right: RX / TX Indicators
+        # Right: RX / TX indicators. Drawn before the progress bar so the bar
+        # knows how much room is genuinely free.
         rx_active = state.get("rx_active", False)
         tx_active = state.get("tx_active", False)
 
@@ -690,9 +759,40 @@ def run(link, title: str = "RC2014 Bridge"):
 
         rx_x = screen_w - rx_img.get_width() - 10
         tx_x = rx_x - tx_img.get_width() - 8
+        _blit_middle(tx_img, tx_x)
+        _blit_middle(rx_img, rx_x)
+        right_edge = tx_x
 
-        surface.blit(tx_img, (tx_x, status_y + (STATUS_BAR_HEIGHT - tx_img.get_height()) // 2))
-        surface.blit(rx_img, (rx_x, status_y + (STATUS_BAR_HEIGHT - rx_img.get_height()) // 2))
+        # XMODEM progress, fitted to the gap between the badges and TX/RX rather
+        # than centred on the window - centring on the whole width made it
+        # overlap the mode badge on a narrow window.
+        if xp.get("active"):
+            filename = xp.get("filename", "file")
+            cur_b = xp.get("current_block", 0)
+            tot_b = xp.get("total_blocks", 0)
+            pct = (cur_b / tot_b * 100.0) if tot_b > 0 else 0.0
+            prog_str = (f"{filename}: {int(pct)}% ({cur_b}/{tot_b})" if tot_b > 0
+                        else f"{filename}: {cur_b} blks")
+            prog_img = status_font.render(prog_str, True, (255, 255, 255))
+
+            gap_start, gap_end = left_edge + 10, right_edge - 10
+            available = gap_end - gap_start
+            pbar_h = 20
+            pbar_y = status_y + (STATUS_BAR_HEIGHT - pbar_h) // 2
+            # Prefer the label's own width so the text always fits inside the bar.
+            pbar_w = min(max(prog_img.get_width() + 16, 160), available)
+
+            if pbar_w >= 60:
+                pbar_x = gap_start + (available - pbar_w) // 2
+                pygame.draw.rect(surface, (40, 48, 58), (pbar_x, pbar_y, pbar_w, pbar_h))
+                if pct > 0:
+                    pygame.draw.rect(surface, (0, 150, 220),
+                                     (pbar_x, pbar_y, int(pbar_w * (pct / 100.0)), pbar_h))
+                pygame.draw.rect(surface, (80, 95, 115), (pbar_x, pbar_y, pbar_w, pbar_h), width=1)
+
+                if prog_img.get_width() <= pbar_w - 6:
+                    surface.blit(prog_img, prog_img.get_rect(
+                        center=(pbar_x + pbar_w // 2, status_y + STATUS_BAR_HEIGHT // 2)))
 
         pygame.display.flip()
         clock.tick(30)
