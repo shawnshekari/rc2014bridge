@@ -1,4 +1,8 @@
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
+
 import pyte
 
 from rc2014bridge.link import SerialLink
@@ -40,6 +44,41 @@ class TestScrollback(unittest.TestCase):
         self.assertTrue(get_top_text(0).startswith("Line 17"))
         self.assertTrue(get_top_text(10).startswith("Line 07"))
         self.assertTrue(get_top_text(17).startswith("Line 00"))
+
+
+class TestGetScreenMaxLines(unittest.TestCase):
+    """max_lines is how the MCP layer keeps a screen read from dumping the
+    entire scrollback; 0 still means 'everything', but only on request."""
+
+    def test_get_screen_max_lines(self):
+        hw_info = os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "hardware_info.json")
+        with patch("serial.Serial") as mock_serial:
+            mock_serial.return_value.is_open = True
+            mock_serial.return_value.read.return_value = b""
+            link = SerialLink(port="/dev/fake", baud=115200, hw_info_file=hw_info)
+        self.addCleanup(link.close)
+
+        with link._screen_lock:
+            for i in range(50):
+                link._stream.feed(f"Line {i+1}\r\n")
+
+        # No max_lines: the live viewport, one entry per screen row
+        self.assertEqual(len(link.get_screen()["lines"]), 48)
+
+        # max_lines=0: the whole scrollback
+        all_lines = [l.strip() for l in link.get_screen(max_lines=0)["lines"] if l.strip()]
+        self.assertEqual(len(all_lines), 50)
+        self.assertEqual(all_lines[0], "Line 1")
+        self.assertEqual(all_lines[-1], "Line 50")
+
+        # An explicit cap returns exactly that many rows, the newest ones. The
+        # very last row is the blank line the cursor sits on, so the newest
+        # content is just above it.
+        capped = link.get_screen(max_lines=10)["lines"]
+        self.assertEqual(len(capped), 10)
+        newest = [l.strip() for l in capped if l.strip()]
+        self.assertEqual(newest[-1], "Line 50")
+        self.assertEqual(newest[0], "Line 42")
 
 
 if __name__ == "__main__":
