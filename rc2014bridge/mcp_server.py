@@ -630,6 +630,14 @@ class McpServer:
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+            # Custom response headers are invisible to browser JS unless listed
+            # here - the Fetch spec only exposes a small safelist by default.
+            # Streamable HTTP clients read the session id off this header on
+            # the initialize response and must echo it back on every request
+            # after; without this, a browser-based client gets a session id
+            # from curl/Node but never sees one, and its next POST comes back
+            # 400 "Missing session ID".
+            expose_headers=["mcp-session-id"],
         )
         return app
 
