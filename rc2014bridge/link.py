@@ -1232,7 +1232,9 @@ class SerialLink:
         return False
 
     def _wait_for_idle_prompt(self, start_pos: int, timeout: float,
-                              idle_settle: float = 0.25, after_echo: str = "") -> dict:
+                              idle_settle: float = 0.25, after_echo: str = "",
+                              nudge_after: float = None, nudge_bytes: bytes = b" ",
+                              max_nudges: int = 500) -> dict:
         """Wait until a prompt is the last thing on the wire and the board has
         gone quiet.
 
@@ -1244,8 +1246,21 @@ class SerialLink:
         this window and reads as "done", returning empty for any command slow to
         start printing. The board echoes what we type, so the prompt that ends
         *our* command is the one after our echo - anchor on that.
+
+        `nudge_after` opts into handling a silent pager: some CP/M programs
+        (ZCPR3's console driver, used by TYPE on this ZSDOS build) page their
+        output by CRT height and block on a keystroke with **no visible
+        prompt at all** - not "-- more --", nothing. Left alone, that reads
+        indistinguishably from "the command is still working" until the
+        overall timeout, so run_command() silently returns just the first
+        page. When set, output going quiet for `nudge_after` without a
+        matched prompt is treated as a paged wait and answered with one
+        `nudge_bytes` keystroke (which the pager consumes without echoing),
+        capped at `max_nudges` so a command that's genuinely hung - not
+        paged - still times out rather than looping forever.
         """
         deadline = time.time() + timeout
+        nudges = 0
         with self._rx_cond:
             while True:
                 text, _pos, _trunc = self._read_since_locked(start_pos)
@@ -1256,10 +1271,20 @@ class SerialLink:
                 if search_from >= 0:
                     m = TRAILING_PROMPT_RE.search(text, search_from)
                     if m and (time.time() - self._last_rx_time) >= idle_settle:
-                        return {"text": text, "prompt": m.group(1).strip(), "timed_out": False}
+                        return {"text": text, "prompt": m.group(1).strip(), "timed_out": False,
+                                "nudges": nudges}
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    return {"text": text, "prompt": "", "timed_out": True}
+                    return {"text": text, "prompt": "", "timed_out": True, "nudges": nudges}
+                if (nudge_after is not None and nudges < max_nudges
+                        and (time.time() - self._last_rx_time) >= nudge_after):
+                    logger.debug("no prompt after %.1fs idle; nudging a possible pager (#%d)",
+                                nudge_after, nudges + 1)
+                    self._write_raw(nudge_bytes)
+                    nudges += 1
+                # Always wait a beat here, nudge or not - sending one and
+                # immediately re-checking would fire a burst of keystrokes
+                # before the board has had any chance to react to the first.
                 self._rx_cond.wait(min(remaining, idle_settle))
 
     @_exclusive("command")
@@ -1755,8 +1780,28 @@ class SerialLink:
         Cheap and needs no transfer, but TYPE expands tabs and stops at the
         0x1A EOF marker, so this is not byte-exact - use download() when it
         has to be.
+
+        This ZSDOS build's console driver pages TYPE's output by CRT height
+        and blocks for a keystroke between pages - silently, with no visible
+        "-- more --" or any other marker. A plain wait-for-prompt reads that
+        as "still running" right up to the timeout and returns just the
+        first page, so this sends a nudge keystroke whenever output goes
+        quiet without a prompt in sight (see _wait_for_idle_prompt) rather
+        than going through the unpaged run_command().
         """
-        res = self.run_command(f"TYPE {cpm_path}", timeout=timeout)
+        command = f"TYPE {cpm_path}"
+        self._wait_until_quiet(0.25)
+        start_pos = self.rx_position()
+        self.send_text(command)
+        waited = self._wait_for_idle_prompt(start_pos, timeout, idle_settle=0.25,
+                                            after_echo=command.strip(), nudge_after=1.0)
+        res = {
+            "ok": not waited["timed_out"],
+            "command": command,
+            "output": _strip_echo_and_prompt(waited["text"], command),
+            "prompt": waited["prompt"],
+            "timed_out": waited["timed_out"],
+        }
         content = res.get("output", "")
         if XM_ERROR_RE.search(content[:200]):
             return {"ok": False, "error": f"could not read {cpm_path}",
