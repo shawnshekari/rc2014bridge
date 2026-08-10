@@ -105,6 +105,11 @@ TRAILING_PROMPT_RE = re.compile(
 )
 PROMPT_ONLY_RE = re.compile(rf"^(?:{_CPM}|(?i:{_HBIOS})|(?i:{_FLASH}))[ \t]*$")
 
+# SUBMIT echoes each line it is about to run as "<drive>$<command>", e.g.
+# "A$LDTIM". Seeing that means a startup script is mid-flight, and ANY console
+# input would abort it.
+SUBMIT_ECHO_RE = re.compile(r"^[A-P][0-9]*\$\S")
+
 # Text XM prints when it has failed to start a transfer, so upload()/download()
 # can fail fast instead of waiting out the full handshake timeout. RomWBW's XM
 # prints its "Receiving:" banner *before* deciding it can't proceed, so the
@@ -576,7 +581,22 @@ class SerialLink:
             if self._mode == "xmodem":
                 direction = self._xmodem_progress.get("direction", "transfer")
                 return f"XMODEM {direction} in progress"
-        return f"{self._current_op} in progress" if self._current_op else None
+        if self._current_op:
+            return f"{self._current_op} in progress"
+        if self.submit_running():
+            return ("a startup/submit script is running (any keystroke aborts it) - "
+                    "use rc2014_wait_until_ready")
+        return None
+
+    def submit_running(self) -> bool:
+        """Whether a SUBMIT script looks to be mid-flight.
+
+        Worth knowing before sending anything: console input aborts a CP/M submit
+        file, so a keystroke during PROFILE.SUB silently truncates a machine's
+        whole startup - clock driver, paths and all.
+        """
+        lines = [l.strip() for l in self.get_screen().get("lines", []) if l.strip()]
+        return bool(lines and SUBMIT_ECHO_RE.match(lines[-1]))
 
     def progress_snapshot(self) -> dict:
         with self._mode_lock:
@@ -756,33 +776,52 @@ class SerialLink:
         logger.info("Drive scan completed. %d drives scanned.", len(results))
         return {"ok": True, "drives": results}
 
-    def _ensure_cpm_prompt(self, settle: float = 1.0) -> bool:
-        """Confirm an OS is running and waiting for a command.
+    def _ensure_cpm_prompt(self, settle: float = 1.0,
+                           timeout: float = BOOT_SETTLE_TIMEOUT) -> bool:
+        """Wait until an OS is running and waiting for a command.
 
-        Looking at the last screen line alone is brittle: a snapshot taken
-        moments after boot can land in the middle of the profile script's output,
-        so a machine that is perfectly ready looks like it isn't. Wait for the
-        line to go quiet - a boot profile can pause between the programs it runs -
-        then nudge with a bare CR, which reprints the prompt.
+        Deliberately passive. Any console input aborts a CP/M SUBMIT file, and
+        PROFILE.SUB is a submit file - so nudging for a prompt during startup
+        kills the very script we are waiting for. That is not theoretical: it
+        silently stopped a PROFILE.SUB after its first line, leaving the clock
+        driver unloaded and file datestamping dead.
+
+        So: wait for the console to fall quiet *and* show a prompt. A CR is sent
+        only if the whole timeout passes with no prompt at all, which means
+        nothing is running that we could interrupt.
         """
-        for attempt in range(2):
-            self._wait_until_quiet(settle, timeout=BOOT_SETTLE_TIMEOUT)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self._wait_until_quiet(settle, timeout=max(0.1, deadline - time.time()))
             lines = [l.strip() for l in self.get_screen().get("lines", []) if l.strip()]
             if lines and CPM_PROMPT_RE.search(lines[-1]):
                 return True
-            if attempt == 0:
-                self.run_command("", timeout=5.0)
-        return False
+            if lines and SUBMIT_ECHO_RE.match(lines[-1]):
+                logger.debug("Startup submit still running (%r); waiting rather than "
+                             "sending a key, which would abort it", lines[-1])
+            time.sleep(0.25)
 
-    def wait_until_ready(self, settle: float = 1.0) -> dict:
+        # Nothing has printed for the whole window and there is no prompt: the
+        # console is idle, so a CR is safe and may simply redraw a prompt that
+        # scrolled past before we attached.
+        logger.info("No prompt after %.0fs of quiet; nudging once", timeout)
+        self.run_command("", timeout=5.0)
+        lines = [l.strip() for l in self.get_screen().get("lines", []) if l.strip()]
+        return bool(lines and CPM_PROMPT_RE.search(lines[-1]))
+
+    def wait_until_ready(self, settle: float = 1.0,
+                         timeout: float = BOOT_SETTLE_TIMEOUT) -> dict:
         """Wait for the machine to finish booting and settle at a prompt.
 
         A boot profile keeps running programs after the OS banner appears, and a
         command sent during that window is simply lost - the board is not reading
         input yet. Seen for real: a 'DIR B:' sent moments after boot arrived as
         'IR B:', its first character swallowed by the profile's own output.
+
+        Waits passively, because PROFILE.SUB is a SUBMIT file and any console
+        input aborts one.
         """
-        ready = self._ensure_cpm_prompt(settle=settle)
+        ready = self._ensure_cpm_prompt(settle=settle, timeout=timeout)
         return {"ok": ready, "state": self._system_state,
                 "prompt": self._last_prompt if ready else "",
                 "error": None if ready else "no prompt after waiting for the machine to settle"}

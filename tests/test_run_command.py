@@ -164,11 +164,39 @@ class TestWaitUntilReady(LinkTestCase):
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["state"], "cpm")
 
-    def test_reports_not_ready_when_no_prompt_appears(self):
-        self.fake.responder = lambda line: None      # nothing ever answers
-        res = self.link.wait_until_ready(settle=0.2)
-        self.assertFalse(res["ok"])
-        self.assertIn("no prompt", res["error"])
+    def test_does_not_send_a_key_while_a_submit_is_running(self):
+        """Console input aborts a CP/M SUBMIT file. Nudging for a prompt during
+        PROFILE.SUB silently truncated a machine's whole startup - the clock
+        driver never loaded and file datestamping stopped working. So while a
+        submit echo is the last thing on screen, wait; never type."""
+        time.sleep(0.3)   # let the link's own startup CR probe land first
+        # SUBMIT echoes "A$LDTIM" then pauses while it loads the program.
+        self.fake.feed(b"\r\nA$LDTIM\r\n")
+        self.wait_for_rx("A$LDTIM")
+        baseline = len(self.fake.written)
+
+        # The profile finishes a beat later and leaves a real prompt.
+        self.feed_later(b"\r\nZSDOS Time Stamp Loader\r\nA$RELOG\r\nA>", after=1.2)
+        res = self.link.wait_until_ready(settle=0.3)
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(bytes(self.fake.written[baseline:]), b"",
+                         "nothing may be sent while the startup script runs")
+
+    def test_reports_submit_running_as_a_busy_reason(self):
+        self.fake.feed(b"\r\nA$ZPATH /D=A0,D0,$\r\n")
+        self.wait_for_rx("A$ZPATH")
+        reason = self.link.busy_reason()
+        self.assertIsNotNone(reason)
+        self.assertIn("aborts it", reason)
+
+    def test_nudges_only_when_nothing_is_running(self):
+        # Idle console, no prompt in the rx window: a CR is safe here and may
+        # redraw a prompt that scrolled past before we attached.
+        self.fake.responder = lambda line: b"\r\nA>"
+        res = self.link.wait_until_ready(settle=0.2, )
+        self.assertTrue(res["ok"], res)
+        self.assertIn(b"\r", bytes(self.fake.written))
 
 
 class TestBootLoaderWarning(LinkTestCase):
