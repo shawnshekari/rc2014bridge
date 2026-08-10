@@ -69,6 +69,8 @@ one call:
 
 ## Quick start
 
+If you're comfortable with Python, this is the whole thing:
+
 ```
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -76,7 +78,81 @@ python3 -m venv .venv
 ```
 
 A window opens showing the console. Type into it like any terminal. The
-MCP server starts with it, on port 8014.
+MCP server starts with it, on port 8014. If that worked, skip to
+["The MCP server"](#the-mcp-server) below.
+
+### Installing and running, step by step
+
+New to running Python projects from source? Here's the same thing in more
+detail.
+
+**1. Install Python.** You need Python 3.10 or newer.
+
+- Check what you have: `python3 --version`
+- Linux: usually already installed; if not, use your distro's package
+  manager (`sudo apt install python3 python3-venv` on Debian/Ubuntu).
+- macOS: `brew install python3`, or the installer from
+  [python.org](https://www.python.org/downloads/).
+- Windows: the installer from [python.org](https://www.python.org/downloads/)
+  — tick "Add python.exe to PATH" during install. Use `py` instead of
+  `python3` in the commands below.
+
+**2. Get the code.** Either `git clone` this repository, or download it as
+a ZIP from GitHub (the green "Code" button) and unzip it. Open a terminal
+in that folder — everything below is run from there.
+
+**3. Create a virtual environment.** This keeps this project's Python
+packages separate from anything else on your machine, in a folder called
+`.venv`:
+
+```
+python3 -m venv .venv
+```
+
+**4. Install the project's dependencies into it:**
+
+```
+.venv/bin/pip install -r requirements.txt
+```
+
+(Windows: `.venv\Scripts\pip install -r requirements.txt`)
+
+This installs `pygame` (the terminal window), `pyserial` (talks to the
+board over USB), `pyte` (the terminal emulator), and the MCP server
+libraries. No system-wide install, nothing touches files outside `.venv`.
+
+**5. Find your serial port.** Plug in the USB-to-serial adapter, then:
+
+- Linux: `ls /dev/ttyUSB*` or `ls /dev/ttyACM*` — usually `/dev/ttyUSB0`.
+  If the port doesn't show up or you get a "Permission denied" error
+  running the app, your user probably isn't in the `dialout` group yet:
+  `sudo usermod -aG dialout $USER`, then log out and back in (a full
+  re-login, not just a new terminal).
+- macOS: `ls /dev/tty.usbserial*` or `ls /dev/tty.usbmodem*`.
+- Windows: check Device Manager under "Ports (COM & LPT)" — it'll be
+  something like `COM3`.
+
+**6. Run it**, using the port you found:
+
+```
+.venv/bin/python -m rc2014bridge.app --port /dev/ttyUSB0
+```
+
+(Windows: `.venv\Scripts\python -m rc2014bridge.app --port COM3`)
+
+A window should open showing a blank terminal. Power on or reboot the
+board and you should see it boot. Click into the window and type — it
+goes straight to the board, just like a terminal program. `Ctrl-C` in the
+window does nothing special (it goes to the board); to quit the app, use
+the **File > Quit** menu or close the window.
+
+**Nothing shows up on the screen?** Wrong baud rate or the board isn't
+actually booting — check with `--baud` (default `115200`) and make sure
+the board is powered. **Window doesn't open at all?** This is a GUI app,
+so it needs a desktop to open a window in — it won't work over a plain
+SSH session without X forwarding (`ssh -X`), and won't work in a
+container with no display. Read the error in the terminal you ran the
+command from; it'll say if that's the problem.
 
 ## The MCP server
 
