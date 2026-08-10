@@ -109,21 +109,52 @@ reading input during that window — a command sent then is silently mangled (a
 real case: `DIR B:` arrived as `IR B:`). Waiting for a prompt to *appear* is not
 enough; this waits for the machine to go quiet.
 
-**At the `Boot [H=Help]:` prompt, send single keys only.** The loader acts on one
-keystroke, so `rc2014_run_command("DIR B:")` there runs `D` (device inventory)
-and still returns a prompt, looking like it worked. `REN A=B` would run `R` —
-reboot. `run_command` returns a `warning` if you do this; heed it.
+**At the `Boot [H=Help]:` prompt, send single keys only.** `rc2014_run_command("DIR
+B:")` there runs `D` (device inventory) off the first character and still
+returns a prompt, looking like it worked. `REN A=B` would run `R` — reboot.
+`run_command` returns a `warning` if you do this; heed it.
+
+The loader reads a line, not a raw keystroke: it needs a terminating Enter
+before it acts. `rc2014_send_text` always appends one, so `rc2014_send_text(text="D")`
+does the right thing without you having to think about it — it just looks
+like "one keystroke, one action" from the tool's side. Anything that sends
+raw bytes without a CR (e.g. driving `link.send_text(..., append_enter=False)`
+directly, bypassing the MCP layer) will instead see the letter sit on the
+prompt line, unacted-on, until a `\r` arrives — confirmed against firmware
+v3.7.0-dev.13.
 
 ### Finding things in the loader
 
-`H` shows help — but it does **not** list everything. `L` lists the ROM
-applications, and several are only reachable there, including the **XModem Flash
-Updater as `X`**. On an SC700 (RomWBW v3.5.0): `M` Monitor, `C` CP/M 2.2,
-`Z` Z-System, `B` BASIC, `T` Tasty BASIC, `F` Forth, `P` Play a Game,
-`N` Network Boot, `X` XModem Flash Updater, `U` User App.
+`H` shows help, and as of firmware v3.7.0-dev.13 it lists everything in one
+screen — no separate `L` needed for ROM applications anymore (older builds,
+e.g. v3.5.0, split some entries like the XModem Flash Updater off into a
+second `L` listing). Current `H` output on an SC700:
+
+```
+<u>[.<s>]   - Boot from Disk <Unit>[.<Slice>]
+D           - Device Inventory
+S           - Slice Inventory
+W           - RomWBW Configure
+O           - Hardware Monitor
+M           - Monitor
+C           - CP/M 2.2
+Z           - Z-System
+N           - Network Boot
+B           - BASIC
+T           - Tasty BASIC
+F           - Forth
+P           - Play a Game
+X           - XModem Flash Updater
+U           - User App
+I <u> [<b>] - Console Interface <Unit> [<Baud>]
+V [<v>]     - View/Set HBIOS Diagnostic [Verbosity>]
+R           - Reboot System
+```
 
 `D` gives the device inventory — use it to find which disk unit to boot, since
-the number differs per machine (unit 2 on one RC2014, unit 4 on an SC700).
+the number differs per machine (unit 2 on one RC2014, unit 4 on an SC700). You
+can also boot a unit directly with `<u>[.<s>]` (e.g. `rc2014_send_text(text="4")`)
+instead of going through `C`/`Z` first.
 
 ## File transfer
 

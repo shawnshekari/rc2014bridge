@@ -28,6 +28,45 @@ hardware).
   against actual RomWBW hardware surfaced quirks a generic wrapper
   wouldn't (see below).
 
+## Screenshots
+
+All captured against a real Small Computer SC700 (`SCZ180_sc700_std`, Z8S180
+@ 18.432MHz) over its serial port — not a simulator.
+
+**Boot menu and CP/M boot sequence**, driven via `rc2014_reboot`: the RomWBW
+HBIOS banner, device inventory, and boot loader, then RomWBW loading CP/M and
+configuring drives.
+
+![Boot menu](docs/screenshots/boot_menu.png)
+![Terminal after boot](docs/screenshots/terminal_boot.png)
+
+**`rc2014_run_command`** sending `DIR C:` and returning the real directory
+listing:
+
+![run_command output](docs/screenshots/run_command_dir.png)
+
+**Hardware & Disk Info modal** (F5), populated from a live `rc2014_scan_drives`
+catalogue — real drive contents, including a Zork/adventure-game collection
+and a Mandelbrot project living on this board's SD card:
+
+![Hardware info modal](docs/screenshots/hardware_info_modal.png)
+
+**XMODEM upload** via `rc2014_upload`: the status bar's progress meter mid-transfer,
+then the board's own "Thanks for the upload" and a `DIR` confirming the file
+landed:
+
+![XMODEM transfer in progress](docs/screenshots/xmodem_inprogress.png)
+![XMODEM transfer complete](docs/screenshots/xmodem_done.png)
+
+**The GUI's File menu**, for the human side of the bridge:
+
+![Menu dropdown](docs/screenshots/menu_dropdown.png)
+
+**`rc2014_survey`** — memory map, BIOS/BDOS addresses, and active I/O ports in
+one call:
+
+![Survey output](docs/screenshots/survey.png)
+
 ## Quick start
 
 ```
