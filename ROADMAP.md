@@ -110,11 +110,15 @@ became **Phase I**, this repo.
 
 ## Paths considered and set aside
 
-1. **MCP server instead of a plain socket.** A standalone MCP tool-call
-   interface is still a fine option if one is ever wanted instead of or
-   alongside the pygame GUI — Phase I uses a plain Unix socket for now
-   since the GUI already needed some local IPC and a second protocol
-   wasn't worth the duplication yet.
+1. ~~**MCP server instead of a plain socket.**~~ **Resolved 2026-08-09 — MCP
+   won.** Phase I originally shipped a Unix-socket JSON API plus a
+   `client.py` CLI, on the reasoning that "the GUI already needed some
+   local IPC." That reasoning turned out to be wrong: the GUI runs in the
+   same process and calls `SerialLink` directly, so nothing ever consumed
+   the socket. Once the MCP server existed, the socket was a second
+   protocol with no consumer, and every new capability cost three
+   implementations (link method, socket dispatch, CLI subcommand). Both
+   `api.py` and `client.py` were deleted; MCP is the only control surface.
 2. **On-device CP/M-hosted agent, built before host-side control.**
    Considered running a `.COM` program on the CF card that owns SIO1 as a
    control channel from the start. Set aside in favor of proving host-side
@@ -150,7 +154,29 @@ instead of trading exclusive access. Confirmed live: Claude booted the CF
 card via the API while the human watched it happen in the pygame window,
 then the human typed `DIR` directly into that same window and it rendered
 correctly — genuine concurrent access, not turn-taking. See `README.md`
-for the implementation and API.
+for the implementation and the tool surface.
+
+**Revised 2026-08-09** after reviewing a real agent session against the
+code. Three things were wrong in the first cut:
+
+- The tool surface made the model poll. `send_text` followed by two to
+  four guessed `get_screen(max_lines=?)` calls per command, with no way
+  to know when a command had finished. Replaced by `run_command`, which
+  waits for the prompt to return and hands back only that command's
+  output. `wait_for` had been unusable for this because it drained a
+  buffer nothing else consumed, so its first call matched instantly
+  against scrollback from minutes earlier.
+- XMODEM upload was silently corrupting files. The block sequence number
+  was never incremented, so a conforming receiver discarded everything
+  after the first 128 bytes while the transfer reported success.
+- Screen-scraping the XMODEM setup (`XM R`/`XM S` with the right drive
+  prefixes) was left to the model and failed repeatedly. Now encoded once
+  in `upload`/`download`, which resolve `XM`'s location from the captured
+  drive mappings, arm the receiver, transfer, and verify.
+
+None of that changes the Phase II premise below — screen-scraping CP/M's
+human-formatted output is still the underlying limitation — but it does
+push out when that becomes the bottleneck.
 
 Still a real limitation, not yet lifted: can't show anything the RC2014
 doesn't itself print to the console — e.g. no way to mirror real Digital
