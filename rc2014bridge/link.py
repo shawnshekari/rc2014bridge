@@ -116,6 +116,38 @@ PROMPT_ONLY_RE = re.compile(rf"^(?:{_CPM}|(?i:{_HBIOS})|(?i:{_FLASH}))[ \t]*$")
 # input would abort it.
 SUBMIT_ECHO_RE = re.compile(r"^[A-P][0-9]*\$\S")
 
+# The HBIOS boot loader's "i <unit> <baud>" command reconfigures one SIO's
+# line speed and echoes the typed command right after its own prompt, e.g.
+# "Boot [H=Help]: i 0 230400". Only unit 0 is the console SIO the bridge is
+# actually wired to - see _update_system_state(). Anchored on an actual
+# trailing newline (not just end-of-buffer/"$") on purpose: input is echoed
+# one character at a time, so the buffer's tail is "...i 0 2", then
+# "...i 0 23", etc. while a baud is still being typed - matching "$" there
+# would fire on that partial number. A newline only appears once Enter has
+# actually been pressed and the whole line is final.
+HBIOS_BAUD_CMD_RE = re.compile(rf"(?:{_HBIOS})\s*i\s+(\d+)\s+(\d+)[ \t]*\r?\n", re.IGNORECASE)
+# What the loader prints once it has accepted that command - by this point
+# its own UART has already switched, so the bridge must follow before
+# anything else is sent, not after.
+HBIOS_BAUD_CONFIRM_RE = re.compile(r"Change speed now.*?Press a key to resume", re.IGNORECASE | re.DOTALL)
+
+# Baud-mismatch line noise detection (_check_for_baud_mismatch): a board
+# reset/reboot/crash while the bridge is still following a runtime-only
+# HBIOS "i 0 <baud>" change (see _follow_hbios_baud_change) comes back up
+# at its power-on default with no recognizable text to pattern-match on -
+# every byte is misframed. PLAUSIBLE_TEXT_RE is what "this looks like real
+# console output" means: printable ASCII plus the handful of controls a
+# terminal actually uses (CR/LF/TAB/BEL/BS/ESC). A byte stream misframed by
+# the wrong baud lands in that ~101/256-value set by chance alone only
+# ~40% of the time, so GARBAGE_RATIO_THRESHOLD sits well below true noise's
+# ~60% expected miss rate while comfortably above what normal console
+# output (including ANSI-heavy screens) produces.
+PLAUSIBLE_TEXT_RE = re.compile(r"[\t\n\r\x07\x08\x1b\x20-\x7e]")
+GARBAGE_MIN_CHUNK_LEN = 12
+GARBAGE_RATIO_THRESHOLD = 0.5
+GARBAGE_STREAK_TO_ACT = 4
+GARBAGE_RECOVERY_COOLDOWN_S = 3.0
+
 # Text XM prints when it has failed to start a transfer, so upload()/download()
 # can fail fast instead of waiting out the full handshake timeout. RomWBW's XM
 # prints its "Receiving:" banner *before* deciding it can't proceed, so the
@@ -524,6 +556,15 @@ class SerialLink:
                  rtscts: bool = False):
         self.port = port
         self.baud = baud
+        # The board's "resting" rate - what --baud/the config file say it
+        # normally runs at. A deliberate reconfigure() (Settings screen, or
+        # a fresh launch) updates this; _follow_hbios_baud_change()'s
+        # runtime-only follow deliberately does not, so
+        # _check_for_baud_mismatch() has something stable to fall back to
+        # if the board resets back to its power-on rate mid-session.
+        self._default_baud = baud
+        self._garbage_streak = 0
+        self._last_garbage_recovery_at = 0.0
         self.cols, self.rows = cols, rows
         self.hw_info_file = hw_info_file
         self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
@@ -571,6 +612,11 @@ class SerialLink:
 
         self._system_state = "unknown"
         self._last_prompt = ""
+        # Set when the HBIOS boot loader echoes an "i 0 <baud>" command for
+        # the console SIO (unit 0), cleared once its "Change speed now"
+        # confirmation is seen and the bridge has followed suit - see
+        # _update_system_state()/_follow_hbios_baud_change().
+        self._pending_hbios_baud: int | None = None
         self.hardware_info = self._load_hardware_info()
 
         # An explicit setting wins; otherwise reuse whatever calibrate_pacing()
@@ -1008,12 +1054,20 @@ class SerialLink:
         threading.Thread(target=_worker, daemon=True).start()
 
     @_exclusive("reconfigure connection")
-    def reconfigure(self, port: str = None, baud: int = None, rtscts: bool = None) -> dict:
+    def reconfigure(self, port: str = None, baud: int = None, rtscts: bool = None,
+                     is_default_change: bool = True) -> dict:
         """Re-init the serial connection: closes the current port and opens
         a new one, optionally at a different device path / baud rate / flow
         control setting (any left as None keeps its current value). Used by
         the GUI's Settings screen. @_exclusive so this can't run out from
         under an in-flight XMODEM transfer or drive scan.
+
+        is_default_change controls whether this also updates
+        self._default_baud - the rate _check_for_baud_mismatch() falls back
+        to if the board resets mid-session. A Settings-screen change is a
+        deliberate new resting rate (default True); _follow_hbios_baud_change()
+        passes False because that's a runtime-only follow of the board's own
+        HBIOS "i" command, not necessarily what it comes back up at.
         """
         new_port = self.port if port is None else port
         new_baud = self.baud if baud is None else baud
@@ -1037,6 +1091,8 @@ class SerialLink:
             self.port = new_port
             self.baud = new_baud
         old_ser.close()
+        if is_default_change:
+            self._default_baud = new_baud
         logger.info("Serial connection reconfigured: %s @ %d baud, rtscts=%s", new_port, new_baud, new_rtscts)
         return {"ok": True, "port": new_port, "baud": new_baud, "rtscts": new_rtscts}
 
@@ -1045,7 +1101,42 @@ class SerialLink:
         self._reader.join(timeout=1.0)
         self._ser.close()
 
+    def _check_for_baud_mismatch(self, text: str):
+        """Recover from the board resetting (reset button, REBOOT, a crashed
+        program) while the bridge is still at a baud it only got to via
+        _follow_hbios_baud_change()'s runtime-only follow. The board comes
+        back up at self._default_baud with no HBIOS text to pattern-match
+        on - every byte is misframed - so this looks for sustained garbage
+        (see PLAUSIBLE_TEXT_RE) instead and falls back once it's confident.
+
+        No-ops entirely once already at _default_baud, so this can't fight
+        a deliberate Settings-screen choice to run somewhere else.
+        """
+        if self.baud == self._default_baud or len(text) < GARBAGE_MIN_CHUNK_LEN:
+            self._garbage_streak = 0
+            return
+
+        plausible = len(PLAUSIBLE_TEXT_RE.findall(text))
+        if (len(text) - plausible) / len(text) < GARBAGE_RATIO_THRESHOLD:
+            self._garbage_streak = 0
+            return
+
+        self._garbage_streak += 1
+        if self._garbage_streak < GARBAGE_STREAK_TO_ACT:
+            return
+        now = time.time()
+        if now - self._last_garbage_recovery_at < GARBAGE_RECOVERY_COOLDOWN_S:
+            return
+
+        self._garbage_streak = 0
+        self._last_garbage_recovery_at = now
+        logger.warning("Received mostly-unreadable data at %d baud (board may have reset to "
+                        "its power-on rate) - falling back to %d baud", self.baud, self._default_baud)
+        self.reconfigure(baud=self._default_baud, is_default_change=False)
+
     def _update_system_state(self, text: str):
+        self._check_for_baud_mismatch(text)
+
         self._boot_buffer += text
         # A fresh banner means a new boot: drop everything before it, or the
         # buffer keeps older banners and the parsers - which take the first match
@@ -1090,6 +1181,53 @@ class SerialLink:
                 self._last_prompt = line_s
             elif re.search(r"([A-Za-z0-9_-]+[:>])", line_s):
                 self._last_prompt = line_s
+
+        # Checked against the accumulated boot buffer, not text.splitlines()
+        # above - the RC2014 echoes typed input one character (or a small
+        # handful) at a time, so "Boot [H=Help]: i 0 230400" is essentially
+        # never present together in a single read's `text`; only the buffer
+        # reliably has the whole line once every character has arrived.
+        # HBIOS_BAUD_CMD_RE is MULTILINE so this also matches a command that
+        # isn't the buffer's last line (e.g. test input, or a fast/looped-
+        # back connection where it arrives alongside later text in one go).
+        # Consumed (sliced out of the buffer) the moment it's matched, so it
+        # can never be found and re-actioned a second time by a later,
+        # unrelated call - re.search() only ever needs to look for one.
+        cmd_m = HBIOS_BAUD_CMD_RE.search(self._boot_buffer)
+        if cmd_m:
+            unit, new_baud = int(cmd_m.group(1)), int(cmd_m.group(2))
+            self._boot_buffer = self._boot_buffer[cmd_m.end():]
+            if unit == 0:
+                logger.info("Detected HBIOS console baud-change command: %d", new_baud)
+                self._pending_hbios_baud = new_baud
+            else:
+                logger.info("Detected HBIOS baud-change command for unit %d "
+                            "(not the bridge's console port) - ignoring", unit)
+
+        # Same reasoning: search the buffer (a short confirmation string can
+        # straddle two reads), and consume it once matched.
+        if self._pending_hbios_baud is not None:
+            confirm_m = HBIOS_BAUD_CONFIRM_RE.search(self._boot_buffer)
+            if confirm_m:
+                new_baud = self._pending_hbios_baud
+                self._pending_hbios_baud = None
+                self._boot_buffer = self._boot_buffer[confirm_m.end():]
+                self._follow_hbios_baud_change(new_baud)
+
+    def _follow_hbios_baud_change(self, new_baud: int):
+        """The HBIOS boot loader has switched the console SIO to `new_baud`
+        and is waiting for a keystroke to resume - by this point its UART
+        has already changed speed, so the bridge must match immediately or
+        that resume keystroke (and everything after it) goes out unheard.
+        Deliberately does not persist this to the config file: this is a
+        boot-loader runtime override, not necessarily what the board will
+        come up at next power-on, so the saved default stays under the
+        user's explicit control via the Settings screen.
+        """
+        logger.info("HBIOS switched its console UART to %d baud - following automatically", new_baud)
+        res = self.reconfigure(baud=new_baud, is_default_change=False)
+        if not res.get("ok"):
+            logger.warning("Auto-follow to %d baud failed: %s", new_baud, res.get("error"))
 
     def enable_pixel_stream(self, enabled: bool = True):
         """Manually force Mandel Pixel-Stream mode on/off - a manual

@@ -473,6 +473,14 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
     pixel_windows: list[PixelStreamWindow] = []
     last_seen_render_id = link.get_pixel_frame().get("render_id")
 
+    # Watched every frame below so a toast fires for *any* connection
+    # change - not just ones started from the Settings screen. In
+    # particular, link.py can reconfigure the port on its own when it sees
+    # HBIOS's console-baud-change sequence go by (see
+    # SerialLink._follow_hbios_baud_change), which never calls into this
+    # file at all.
+    last_seen_connection = (link.port, link.baud)
+
     def _show_toast(text: str, seconds: float = 4.0):
         nonlocal toast_text, toast_expires
         toast_text = text
@@ -503,7 +511,10 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                 bridge_config.update_value(config_path, "serial", "port", res["port"])
                 bridge_config.update_value(config_path, "serial", "baud", str(res["baud"]))
                 bridge_config.update_value(config_path, "serial", "rtscts", "true" if res["rtscts"] else "false")
-                _show_toast(f"Reconnected at {res['port']} @ {res['baud']} baud")
+                # No toast here - the port/baud watcher in the main loop
+                # covers it, and also catches HBIOS's own auto-followed baud
+                # changes (see link.py's _follow_hbios_baud_change), which
+                # never go through this method at all.
             else:
                 error = res.get("error", "unknown error")
                 settings_status = (f"Failed: {error}", False)
@@ -790,6 +801,11 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     continue
 
                 link.send_text(data.decode("latin-1"), append_enter=False)
+
+        current_connection = (link.port, link.baud)
+        if current_connection != last_seen_connection:
+            last_seen_connection = current_connection
+            _show_toast(f"Connected: {link.port} @ {link.baud} baud")
 
         # Spawn a new popup the moment a new render starts (render_id
         # change), independent of whether the main window's embedded view

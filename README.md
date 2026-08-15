@@ -40,6 +40,10 @@ hardware).
   live-scanned dropdown, choose a baud rate and RTS/CTS, test a combination
   before committing, and reconnect live without restarting — see
   [Connection settings](#connection-settings).
+- **Automatic baud handling**: follows the board's own HBIOS `i 0 <baud>`
+  speed changes live, and falls back to the configured default baud if the
+  board resets mid-session and starts producing line noise instead — also in
+  [Connection settings](#connection-settings).
 - **Config file** (`rc2014bridge.ini`), so the long list of CLI flags only
   has to be set once — see [Config file](#config-file).
 - **Serial pacing calibration** (`rc2014_calibrate_pacing`): finds the
@@ -186,6 +190,29 @@ and writes the change back to the config file so a restart picks up the
 same settings automatically.
 
 **On the command line / in a config file:** `--port`, `--baud`, `--rtscts`.
+
+**Automatic:** if you run HBIOS's boot loader `i 0 <baud>` command (e.g.
+`i 0 230400` at the `Boot [H=Help]:` prompt) to change the console SIO's own
+speed, the bridge notices the echoed command and its "Change speed now..."
+confirmation and reconfigures its end to match automatically - no need to
+open the Settings screen yourself. This only follows unit 0 (the console
+port the bridge is actually wired to); an `i 1 ...` for the other SIO is
+left alone. It's a live-session follow, not persisted to the config file -
+that command is a boot-loader runtime override, not necessarily what the
+board comes up at after a power cycle, so the saved default stays under
+your explicit control via Apply & Reconnect.
+
+That follow is easy to strand: reset the board (reset button, `REBOOT`, a
+crashed program) while the bridge is still on the followed rate, and the
+board comes back up at its power-on default with nothing recognizable to
+match against - just line noise at the bridge's now-wrong rate. The bridge
+watches for that too: a sustained run of mostly-unreadable bytes at
+anything other than the board's resting baud (`--baud`/the config file's
+value, not wherever a HBIOS follow last left it) falls back to that resting
+rate automatically. It only ever tries that one rate once conditions look
+like noise again - not a hunt through every possible baud - so if the board
+is doing something else entirely, use Connection Settings to sort it out
+by hand.
 
 ## Config file
 
