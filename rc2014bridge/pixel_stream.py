@@ -9,6 +9,7 @@ Maps 5-bit pixel indices (0-30) to RGB colors and handles control tokens:
 """
 
 import threading
+import time
 
 # 31 RGB color entries matching mandel_pixel_stream.yaml
 PALETTE: list[tuple[int, int, int]] = [
@@ -55,11 +56,19 @@ class PixelStreamDecoder:
 
     def __init__(self):
         self._lock = threading.Lock()
+        # Monotonically increasing "which render is this" counter - unlike
+        # everything else reset() clears, this must survive across resets:
+        # display.py's multi-window support (one popup per render) uses a
+        # change in this value to know a *new* render just started, distinct
+        # from "this render is still in progress" or "still showing the
+        # last completed one".
+        self.render_id = 0
         self.reset()
 
     def reset(self):
-        """Reset all decoder state."""
+        """Reset all decoder state (except render_id, which this bumps)."""
         with self._lock:
+            self.render_id += 1
             self._state = "NORMAL"  # "NORMAL", "EXTENDED_RUN", "VERSION_BYTE"
             self._pending_index = None
             self.version = None
@@ -71,14 +80,35 @@ class PixelStreamDecoder:
             self.last_complete_rgb_frame: list[list[tuple[int, int, int]]] = []
             self.frame_count = 0
             self.total_bytes_processed = 0
+            # Render timing: started_at is set here (reset() runs right as
+            # the first byte, VERSION_BANNER, is detected - see link.py's
+            # auto-detect); completed_at is set in feed() the instant
+            # END_OF_FRAME is consumed. Neither claims to be a true "time
+            # on the wire" measurement (this is host-side wall clock, not
+            # a device-side timestamp), but it brackets the render as seen
+            # by the bridge, which is what a popup window's title wants.
+            self.started_at = time.time()
+            self.completed_at = None
 
-    def feed(self, data: bytes | list[int] | bytearray):
-        """Feed a chunk of bytes to the decoder."""
+    def feed(self, data: bytes | list[int] | bytearray) -> int | None:
+        """Feed a chunk of bytes to the decoder.
+
+        Returns the index into `data` just past an END_OF_FRAME token if
+        one was completed during this call, and stops consuming right
+        there - the protocol has nothing to say about bytes after a
+        frame ends, so the caller (link.py's auto mode-switching) is
+        expected to route the remainder elsewhere, e.g. back to the
+        terminal pipeline. Returns None if the whole chunk was consumed
+        without completing a frame."""
         if not data:
-            return
+            return None
 
         with self._lock:
-            for b in data:
+            i = 0
+            n = len(data)
+            while i < n:
+                b = data[i]
+                i += 1
                 self.total_bytes_processed += 1
 
                 if self._state == "EXTENDED_RUN":
@@ -116,6 +146,8 @@ class PixelStreamDecoder:
                             self.frame_count += 1
                             self._current_raw_frame = []
                             self._current_rgb_frame = []
+                            self.completed_at = time.time()
+                            return i
                         elif code == 2:  # VERSION_BANNER (0xFA)
                             self._state = "VERSION_BYTE"
                     else:  # Pixel token
@@ -127,6 +159,7 @@ class PixelStreamDecoder:
                         elif code == 7:
                             self._pending_index = idx
                             self._state = "EXTENDED_RUN"
+            return None
 
     def get_rgb_frame(self) -> list[list[tuple[int, int, int]]]:
         """Return the latest complete RGB frame (or active frame if incomplete)."""
@@ -149,7 +182,9 @@ class PixelStreamDecoder:
 
             rows = len(target_frame)
             cols = max((len(r) for r in target_frame), default=0)
+            elapsed_s = (self.completed_at - self.started_at) if self.completed_at else None
             return {
+                "render_id": self.render_id,
                 "version": self.version,
                 "frame_count": self.frame_count,
                 "total_bytes": self.total_bytes_processed,
@@ -157,4 +192,5 @@ class PixelStreamDecoder:
                 "cols": cols,
                 "rgb_data": target_frame,
                 "is_complete": bool(self.last_complete_rgb_frame),
+                "elapsed_s": elapsed_s,
             }

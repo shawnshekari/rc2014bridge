@@ -22,6 +22,7 @@ import threading
 import time
 
 import pygame
+from pygame._sdl2.video import Renderer, Texture, Window
 
 FG = (110, 255, 110)
 BG = (10, 12, 10)
@@ -216,6 +217,131 @@ def _open_system_file_dialog(mode: str = "open", title: str = "Select File") -> 
     return None
 
 
+# mandel_z80's x_step:y_step samples a non-square grid - each cell is 2x
+# taller than wide in real coordinate space. The old ANSI/character output
+# hid this on purpose (a monospace terminal cell is itself ~2:1 tall:wide,
+# chosen to match), so a bare 1:1 square-pixel render looks squished. True
+# RGB pixel drawing doesn't get that accidental correction for free, so it's
+# applied explicitly here instead. See protocol/DESIGN.md's Activation
+# section note and mandel's PLAN.md for the sender-side step sizes.
+PIXEL_ASPECT_Y_OVER_X = 2
+
+
+def _pixel_cell_size(rgb_grid, max_w: int, max_h: int) -> tuple[int, int, int, int]:
+    """Aspect-correct (cell_w, cell_h, p_cols, p_rows) fitting rgb_grid's
+    grid into max_w x max_h, each cell PIXEL_ASPECT_Y_OVER_X times taller
+    than wide. cell_w is 0 if the grid is empty or doesn't fit at all."""
+    p_rows = len(rgb_grid)
+    p_cols = max((len(r) for r in rgb_grid), default=0)
+    if p_rows == 0 or p_cols == 0:
+        return 0, 0, p_rows, p_cols
+    cell_w = max(1, min(max_w // p_cols, max_h // (p_rows * PIXEL_ASPECT_Y_OVER_X)))
+    return cell_w, cell_w * PIXEL_ASPECT_Y_OVER_X, p_cols, p_rows
+
+
+def _draw_pixel_grid(surface, rgb_grid, origin: tuple[int, int], cell_w: int, cell_h: int):
+    """Draw rgb_grid onto surface as cell_w x cell_h rects starting at origin."""
+    ox, oy = origin
+    for r_idx, row in enumerate(rgb_grid):
+        for c_idx, rgb in enumerate(row):
+            rect = pygame.Rect(ox + c_idx * cell_w, oy + r_idx * cell_h, cell_w, cell_h)
+            pygame.draw.rect(surface, rgb, rect)
+
+
+class PixelStreamWindow:
+    """A standalone, non-modal popup window for exactly one Mandel pixel-
+    stream render, identified by the decoder's render_id. Running MANDELPX
+    (or similar) N times produces N of these, each keeping its own finished
+    image on screen rather than one being overwritten by the next - unlike
+    the main window's embedded pixel view, which always shows whichever
+    render is currently live in the shared link/decoder.
+
+    Deliberately simple: shows a placeholder immediately on open, then does
+    exactly one real draw once its render completes (checked via
+    is_complete on the shared decoder's snapshot) and stops updating -  no
+    per-frame live redraw/resize while data is still streaming in. The
+    embedded main view already covers "watch it fill in live"; a popup's
+    job is just "keep this result around to compare against others."
+    """
+
+    MAX_W, MAX_H = 900, 700
+    PLACEHOLDER_SIZE = (420, 90)
+
+    def __init__(self, render_id: int, font):
+        self.render_id = render_id
+        self._font = font
+        self._done = False
+        self.closed = False
+        self.window = Window(f"Mandel Pixel-Stream - render #{render_id}",
+                              size=self.PLACEHOLDER_SIZE, resizable=True)
+        self.renderer = Renderer(self.window)
+        self._draw_placeholder()
+
+    def _present(self, surf):
+        tex = Texture.from_surface(self.renderer, surf)
+        self.renderer.clear()
+        tex.draw()
+        self.renderer.present()
+
+    def _draw_placeholder(self):
+        surf = pygame.Surface(self.PLACEHOLDER_SIZE)
+        surf.fill((10, 10, 15))
+        msg = self._font.render("Awaiting Mandel Pixel-Stream data...", True, (150, 180, 210))
+        surf.blit(msg, ((self.PLACEHOLDER_SIZE[0] - msg.get_width()) // 2,
+                         (self.PLACEHOLDER_SIZE[1] - msg.get_height()) // 2))
+        self._present(surf)
+
+    def handle_event(self, event):
+        if event.type == pygame.WINDOWCLOSE and getattr(event, "window", None) is self.window:
+            self.closed = True
+
+    def update(self, link):
+        """Poll once per tick; no-op after the first real draw or once this
+        render has been superseded without ever completing."""
+        if self.closed or self._done:
+            return
+        snap = link.get_pixel_frame()
+        if snap.get("render_id") != self.render_id:
+            # A newer render started before this one ever completed (e.g.
+            # aborted mid-stream) - leave the placeholder up rather than
+            # showing a different render's data in this window.
+            self._done = True
+            return
+        if not snap.get("is_complete"):
+            return
+
+        rgb_grid = snap.get("rgb_data", [])
+        cell_w, cell_h, p_cols, p_rows = _pixel_cell_size(rgb_grid, self.MAX_W, self.MAX_H)
+        if cell_w <= 0:
+            self._done = True
+            return
+
+        # elapsed_s brackets VERSION_BANNER (reset(), i.e. first byte) to
+        # END_OF_FRAME (last byte) on the decoder - see pixel_stream.py's
+        # comment on started_at/completed_at for what this is (and isn't)
+        # measuring. Host-side wall clock, not a device timestamp.
+        elapsed_s = snap.get("elapsed_s")
+        elapsed_str = f"{elapsed_s:.2f}s" if elapsed_s is not None else "?"
+        self.window.title = f"Mandel Pixel-Stream - render #{self.render_id} ({elapsed_str})"
+
+        px_w, px_h = p_cols * cell_w, p_rows * cell_h
+        tag_text = f" PIXEL-STREAM v{snap.get('version') or 1} | {p_cols}x{p_rows} | {elapsed_str} "
+        tag_img = self._font.render(tag_text, True, (255, 255, 255), (30, 90, 160))
+        content_w = max(px_w, tag_img.get_width())
+        content_h = px_h + tag_img.get_height() + 2
+
+        self.window.size = (content_w, content_h)
+        surf = pygame.Surface((content_w, content_h))
+        surf.fill((10, 10, 15))
+        surf.blit(tag_img, (0, 0))
+        _draw_pixel_grid(surf, rgb_grid, (0, tag_img.get_height() + 2), cell_w, cell_h)
+        self._present(surf)
+        self._done = True
+
+    def destroy(self):
+        self.window.destroy()
+
+
 def window_title(link, base: str = "RC2014 Bridge") -> str:
     """Name the machine in the title bar.
 
@@ -253,6 +379,14 @@ def run(link, title: str = "RC2014 Bridge"):
     toast_text = None
     toast_expires = 0.0
     running = True
+
+    # Each new Mandel pixel-stream render (detected via a render_id change)
+    # gets its own popup window - see PixelStreamWindow's docstring.
+    # Seeded from the decoder's current render_id (starts at 1, not 0/None,
+    # per PixelStreamDecoder.__init__) so no phantom popup spawns on launch
+    # before any real render has happened.
+    pixel_windows: list[PixelStreamWindow] = []
+    last_seen_render_id = link.get_pixel_frame().get("render_id")
 
     def _show_toast(text: str, seconds: float = 4.0):
         nonlocal toast_text, toast_expires
@@ -311,8 +445,8 @@ def run(link, title: str = "RC2014 Bridge"):
         elif action == "SHOW_HW_INFO":
             show_hw_info_modal = True
         elif action == "TOGGLE_PIXEL_STREAM":
-            cur_m = getattr(link, "_mode", "terminal")
-            new_en = (cur_m != "pixel_stream")
+            cur_shown = getattr(link, "_show_pixel_view", False)
+            new_en = not cur_shown
             link.enable_pixel_stream(new_en)
             if new_en:
                 _show_toast("Mandel Pixel-Stream mode ENABLED (F7 to toggle)")
@@ -327,6 +461,16 @@ def run(link, title: str = "RC2014 Bridge"):
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
+            # The primary window's own events always have event.window is
+            # None (confirmed empirically); only secondary popup windows
+            # set it, to the Window object itself.
+            event_window = getattr(event, "window", None)
+            if event_window is not None:
+                for pw in pixel_windows:
+                    if event_window is pw.window:
+                        pw.handle_event(event)
+                        break
+                continue
             if event.type == pygame.QUIT:
                 running = False
             elif hasattr(pygame, "MOUSEWHEEL") and event.type == pygame.MOUSEWHEEL:
@@ -466,6 +610,25 @@ def run(link, title: str = "RC2014 Bridge"):
 
                 link.send_text(data.decode("latin-1"), append_enter=False)
 
+        # Spawn a new popup the moment a new render starts (render_id
+        # change), independent of whether the main window's embedded view
+        # is even showing pixel-stream mode right now. Then let every open
+        # popup do its own polling/redraw, and drop ones the user closed.
+        pixel_snap = link.get_pixel_frame()
+        current_render_id = pixel_snap.get("render_id")
+        if current_render_id is not None and current_render_id != last_seen_render_id:
+            last_seen_render_id = current_render_id
+            pixel_windows.append(PixelStreamWindow(current_render_id, font))
+        for pw in pixel_windows:
+            pw.update(link)
+        still_open = []
+        for pw in pixel_windows:
+            if pw.closed:
+                pw.destroy()
+            else:
+                still_open.append(pw)
+        pixel_windows = still_open
+
         state = link.get_screen(scroll_offset=scroll_offset)
         scroll_offset = state.get("scroll_offset", 0)
         surface.fill(BG)
@@ -480,31 +643,25 @@ def run(link, title: str = "RC2014 Bridge"):
         # --------------------------------------------------------------
         # 1. Render Terminal / Pixel Stream Viewport
         # --------------------------------------------------------------
-        if getattr(link, "_mode", "terminal") == "pixel_stream":
+        if getattr(link, "_show_pixel_view", False):
             snap = link.get_pixel_frame()
             rgb_grid = snap.get("rgb_data", [])
             view_h = screen_h - TOP_MENU_HEIGHT - STATUS_BAR_HEIGHT
             if rgb_grid:
-                p_rows = len(rgb_grid)
-                p_cols = max((len(r) for r in rgb_grid), default=0)
-                if p_rows > 0 and p_cols > 0:
-                    scale_x = max(1, screen_w // p_cols)
-                    scale_y = max(1, view_h // p_rows)
-                    scale = min(scale_x, scale_y)
-
-                    px_w = p_cols * scale
-                    px_h = p_rows * scale
+                pcell_w, pcell_h, p_cols, p_rows = _pixel_cell_size(rgb_grid, screen_w, view_h)
+                if pcell_w > 0:
+                    px_w = p_cols * pcell_w
+                    px_h = p_rows * pcell_h
                     start_x = (screen_w - px_w) // 2
                     start_y = term_y + (view_h - px_h) // 2
 
                     pygame.draw.rect(surface, (10, 10, 15), (0, term_y, screen_w, view_h))
-                    for r_idx, row in enumerate(rgb_grid):
-                        for c_idx, rgb in enumerate(row):
-                            rect = pygame.Rect(start_x + c_idx * scale, start_y + r_idx * scale, scale, scale)
-                            pygame.draw.rect(surface, rgb, rect)
+                    _draw_pixel_grid(surface, rgb_grid, (start_x, start_y), pcell_w, pcell_h)
 
                     tag_ver = snap.get("version") or 1
-                    tag_text = f" PIXEL-STREAM v{tag_ver} | Frame {snap.get('frame_count')} | {p_cols}x{p_rows} "
+                    elapsed_s = snap.get("elapsed_s")
+                    elapsed_str = f"{elapsed_s:.2f}s" if elapsed_s is not None else "in progress"
+                    tag_text = f" PIXEL-STREAM v{tag_ver} | Frame {snap.get('frame_count')} | {p_cols}x{p_rows} | {elapsed_str} "
                     tag_img = font.render(tag_text, True, (255, 255, 255), (30, 90, 160))
                     surface.blit(tag_img, (start_x, max(term_y + 4, start_y - tag_img.get_height() - 2)))
             else:
@@ -845,6 +1002,8 @@ def run(link, title: str = "RC2014 Bridge"):
         pygame.display.flip()
         clock.tick(30)
 
+    for pw in pixel_windows:
+        pw.destroy()
     pygame.quit()
 
 

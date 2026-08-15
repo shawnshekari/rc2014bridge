@@ -38,7 +38,7 @@ import time
 import pyte
 import serial
 
-from rc2014bridge.pixel_stream import PixelStreamDecoder
+from rc2014bridge.pixel_stream import VERSION_BANNER, PixelStreamDecoder
 
 logger = logging.getLogger("rc2014bridge")
 
@@ -512,6 +512,14 @@ class SerialLink:
 
         self._mode = "terminal"
         self._mode_lock = threading.Lock()
+        # Display-only: which viewport display.py draws. Deliberately
+        # separate from _mode - _mode auto-reverts to "terminal" the
+        # instant a pixel-stream frame's END_OF_FRAME is seen (so the
+        # *next* bytes, e.g. this program's own post-render text, parse
+        # correctly), but the just-completed image should stay on screen
+        # until a new render starts or the user explicitly switches back,
+        # not vanish the moment decoding finishes.
+        self._show_pixel_view = False
         self._xmodem_q: "queue.Queue[int]" = queue.Queue()
         self._pixel_decoder = PixelStreamDecoder()
 
@@ -1003,16 +1011,21 @@ class SerialLink:
                 self._last_prompt = line_s
 
     def enable_pixel_stream(self, enabled: bool = True):
-        """Toggle Mandel Pixel-Stream protocol decoder mode."""
+        """Manually force Mandel Pixel-Stream mode on/off - a manual
+        override on top of the automatic VERSION_BANNER/END_OF_FRAME
+        detection in _read_loop (see its comments), useful for testing or
+        to force the view back to terminal early."""
         with self._mode_lock:
             if enabled:
                 self._mode = "pixel_stream"
+                self._show_pixel_view = True
                 self._pixel_decoder.reset()
                 logger.info("Enabled Mandel Pixel-Stream decoder mode")
             else:
                 if self._mode == "pixel_stream":
                     self._mode = "terminal"
-                    logger.info("Disabled Pixel-Stream mode; reverted to terminal")
+                self._show_pixel_view = False
+                logger.info("Disabled Pixel-Stream mode; reverted to terminal")
 
     def get_pixel_frame(self) -> dict:
         """Get snapshot of current decoded Mandel pixel frame."""
@@ -1035,16 +1048,56 @@ class SerialLink:
             if mode == "xmodem":
                 for b in data:
                     self._xmodem_q.put(b)
-            elif mode == "pixel_stream":
-                self._pixel_decoder.feed(data)
-            else:
-                text = data.decode("latin-1")
-                self._update_system_state(text)
-                with self._screen_lock:
-                    self._stream.feed(text)
-                # Appended last, so a waiter woken by this chunk sees a screen
-                # buffer that already reflects it.
-                self._rx_append(text)
+                continue
+
+            # terminal/pixel_stream mode-switching is automatic, driven
+            # entirely by bytes on the wire (VERSION_BANNER in, END_OF_FRAME
+            # out) - no MCP call or human toggle required, so a Mandel
+            # pixel-stream render decodes correctly even with nobody
+            # watching. A single 4096-byte read can contain a mode
+            # transition mid-chunk (e.g. this program's plain-text welcome
+            # banner immediately followed by VERSION_BANNER, or the binary
+            # frame's END_OF_FRAME immediately followed by its "Computations
+            # completed" text), so this walks the chunk and routes each
+            # sub-span to whichever pipeline owns it at that point - see
+            # protocol/DESIGN.md's Activation section.
+            pos = 0
+            n = len(data)
+            while pos < n:
+                with self._mode_lock:
+                    mode = self._mode
+                if mode == "pixel_stream":
+                    consumed_to = self._pixel_decoder.feed(data[pos:])
+                    if consumed_to is None:
+                        pos = n
+                    else:
+                        pos += consumed_to
+                        with self._mode_lock:
+                            self._mode = "terminal"
+                else:
+                    banner_at = data.find(bytes([VERSION_BANNER]), pos)
+                    if banner_at == -1:
+                        text = data[pos:].decode("latin-1")
+                        self._update_system_state(text)
+                        with self._screen_lock:
+                            self._stream.feed(text)
+                        # Appended last, so a waiter woken by this chunk sees
+                        # a screen buffer that already reflects it.
+                        self._rx_append(text)
+                        pos = n
+                    else:
+                        if banner_at > pos:
+                            text = data[pos:banner_at].decode("latin-1")
+                            self._update_system_state(text)
+                            with self._screen_lock:
+                                self._stream.feed(text)
+                            self._rx_append(text)
+                        with self._mode_lock:
+                            self._mode = "pixel_stream"
+                            self._show_pixel_view = True
+                        self._pixel_decoder.reset()
+                        logger.info("Auto-detected Mandel Pixel-Stream VERSION_BANNER; switching to pixel_stream mode")
+                        pos = banner_at
 
     def _xq_get(self, timeout):
         try:

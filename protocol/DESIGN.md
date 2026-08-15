@@ -110,25 +110,38 @@ extension bytes, on both flat and detail-heavy rows.
 
 ## Activation: how the bridge knows to switch modes
 
-Auto-detecting this protocol from arbitrary incoming bytes is explicitly
-**not** the recommended design - `rc2014bridge` talks to many different
-CP/M programs, and false-triggering a full display-mode switch (leaving
-`pyte`, drawing raw pixels instead) from a coincidental byte sequence
-would be a bad failure mode. Recommended instead: an explicit, caller-
-declared opt-in - e.g. a new parameter on the run-command path
-(`decode_protocol="mandel-pixel-stream-v1"` or similar) that tells the
-bridge "route incoming bytes through this decoder and the pixel-view
-renderer until `END_OF_FRAME` or a timeout, instead of the normal
-terminal path." The `VERSION_BANNER` control token exists as a second,
-defense-in-depth check on top of that explicit opt-in - not a
-replacement for it: once told to expect this protocol, the bridge can
-still confirm the version banner matches before trusting the rest of the
-stream.
+**Decided (superseding an earlier draft of this section): fully
+automatic, driven by bytes on the wire, no opt-in required.**
+`SerialLink._read_loop()` scans incoming bytes for `VERSION_BANNER`
+(`0xFA`) while in terminal mode; seeing it switches the link to
+`pixel_stream` mode and resets the decoder, with no MCP call, run-command
+parameter, or human toggle needed first. The link auto-reverts back to
+terminal mode the instant `PixelStreamDecoder.feed()` reports it consumed
+an `END_OF_FRAME` token. Rationale: a render has to decode correctly even
+when nobody (no MCP client, no human) is watching or has armed anything
+in advance - an opt-in-only design fails exactly that case. `rc2014_
+enable_pixel_stream` (MCP tool) and the display's View-menu toggle still
+exist as manual overrides (useful for testing, or forcing the mode off),
+but they are no longer required for a real render to display correctly.
 
-This is a real open decision, not settled by this doc - the bridge-side
-implementer should propose the exact mechanism (new MCP tool parameter,
-a separate tool entirely, etc.) since it depends on `rc2014bridge`'s
-existing `SerialLink`/MCP tool architecture more than this repo's.
+The earlier concern that motivated preferring an explicit opt-in - false-
+triggering on a coincidental byte from some unrelated CP/M program - is
+real but judged acceptable here: `rc2014bridge` is a single-user hobby
+tool, `0xFA` immediately followed by a plausible token stream is a fairly
+specific signal (plain CP/M text output essentially never emits bytes
+>=0x80), and the failure mode (a few bytes of some other program's output
+misrendered as garbage pixels, self-correcting at the next `END_OF_FRAME`
+or manual toggle) is minor compared to requiring every caller to remember
+an opt-in. If this ever causes a real false-positive in practice, revisit
+- e.g. requiring the version byte to also match before committing to the
+mode switch - rather than reverting to opt-in-only.
+
+A single serial read can straddle a mode transition mid-chunk (this
+program's plain-text welcome banner immediately followed by
+`VERSION_BANNER`, or a frame's `END_OF_FRAME` immediately followed by its
+"Computations completed" text) - `_read_loop` walks each chunk and routes
+each sub-span to whichever pipeline owns it at that point, rather than
+assuming a chunk is ever purely one or the other.
 
 ## Where the decode hook goes (bridge side)
 
