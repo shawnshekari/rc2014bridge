@@ -67,13 +67,9 @@ def main():
                    help="Host IP to bind the MCP server (default: %(default)s)")
     p.add_argument("--mcp-port", type=int, default=_cfg_int(cfg, "mcp-port", 8014),
                    help="Port for the MCP server (default: %(default)s)")
-    p.add_argument("--mcp-transport", choices=["http", "sse", "both"],
-                   default=_cfg_str(cfg, "mcp-transport", "both"),
-                   help="Serve streamable HTTP at /mcp, the older SSE at /sse, or both "
-                        "(default: %(default)s)")
     p.add_argument("--xmodem-pacing", metavar="CHUNK:DELAY_MS", default=_cfg_str(cfg, "xmodem-pacing", None),
-                   help="Override XMODEM write pacing, e.g. 128:2. Default: whatever "
-                        "rc2014_calibrate_pacing last proved on this machine, else 8:10")
+                   help="Override XMODEM write pacing, e.g. 128:2. Default: whatever a "
+                        "previous pacing calibration proved on this machine, else 8:10")
     p.add_argument("--text-pacing", metavar="CHUNK:DELAY_MS", default=_cfg_str(cfg, "text-pacing", None),
                    help="Override keystroke/command write pacing, e.g. 8:5 (default 1:15)")
     p.add_argument("--rtscts", action="store_true", default=_cfg_bool(cfg, "rtscts", False),
@@ -110,8 +106,7 @@ def main():
     mcp_server = None
     if args.mcp:
         try:
-            mcp_server = McpServer(link, host=args.mcp_host, port=args.mcp_port,
-                                   transport=args.mcp_transport)
+            mcp_server = McpServer(link, host=args.mcp_host, port=args.mcp_port)
             mcp_server.start()
             for url in mcp_server.endpoints():
                 logging.info("MCP endpoint: %s", url)

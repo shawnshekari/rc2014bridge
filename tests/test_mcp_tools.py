@@ -25,7 +25,7 @@ def _server() -> tuple[McpServer, MagicMock]:
     link.busy_reason.return_value = None
     link.progress_snapshot.return_value = {
         "op": "", "xmodem": {"active": False}, "scan": {"active": False}}
-    return McpServer(link, transport="both"), link
+    return McpServer(link), link
 
 
 def _text(result) -> str:
@@ -39,7 +39,7 @@ class TestToolRegistration(unittest.TestCase):
         self.assertLessEqual(
             {"rc2014_run_command", "rc2014_get_screen", "rc2014_send_text",
              "rc2014_send_keys", "rc2014_wait_for", "rc2014_wait_until_ready",
-             "rc2014_calibrate_pacing", "rc2014_upload",
+             "rc2014_upload",
              "rc2014_download", "rc2014_read_text_file", "rc2014_write_text_file",
              "rc2014_scan_drives", "rc2014_survey", "rc2014_get_hardware_info",
              "rc2014_reboot",
@@ -163,26 +163,12 @@ class TestHardwareDoc(unittest.TestCase):
 
 
 class TestTransports(unittest.TestCase):
-    def test_both_transports_are_served_by_one_app(self):
+    def test_only_the_stateless_mcp_endpoint_is_served(self):
         server, _link = _server()
         paths = [getattr(r, "path", None) for r in server._build_app().router.routes]
         self.assertIn("/mcp", paths)
-        self.assertIn("/sse", paths)
-        self.assertEqual(server.endpoints(),
-                         ["http://0.0.0.0:8014/mcp", "http://0.0.0.0:8014/sse"])
-
-    def test_http_only_and_sse_only(self):
-        link = MagicMock()
-        link.hardware_info = {}
-        http_paths = [getattr(r, "path", None)
-                      for r in McpServer(link, transport="http")._build_app().router.routes]
-        self.assertIn("/mcp", http_paths)
-        self.assertNotIn("/sse", http_paths)
-
-        sse_paths = [getattr(r, "path", None)
-                     for r in McpServer(link, transport="sse")._build_app().router.routes]
-        self.assertIn("/sse", sse_paths)
-        self.assertNotIn("/mcp", sse_paths)
+        self.assertNotIn("/sse", paths)
+        self.assertEqual(server.endpoints(), ["http://0.0.0.0:8014/mcp"])
 
 
 if __name__ == "__main__":

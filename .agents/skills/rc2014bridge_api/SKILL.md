@@ -14,8 +14,7 @@ daemon.
 `rc2014bridge` exposes a single control surface: an **MCP server** on port
 8014 of the host running the bridge.
 
-- Streamable HTTP (preferred): `http://<host-ip>:8014/mcp`
-- SSE (legacy clients): `http://<host-ip>:8014/sse`
+- Stateless streamable HTTP (2026-07-28 spec): `http://<host-ip>:8014/mcp`
 
 A human may be watching the same console in a pygame window, so everything
 you type is visible to them.

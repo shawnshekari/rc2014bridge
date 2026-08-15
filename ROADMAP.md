@@ -271,6 +271,57 @@ module already on hand.
    almost certainly saturates the RP2040's timing budget) — likely an
    either/or per physical unit, not both at once.
 
+## Also planned
+
+- ~~**Move the MCP server to the 2026-07-28 stateless spec.**~~ **Resolved
+  2026-08-15**, same day it was logged. The blocker as originally written
+  was "revisit once the `mcp` Python SDK ships stateless support" — turned
+  out the installed SDK (`mcp` 2.0.0, unpinned in `requirements.txt`)
+  already had it. `mcp/server/streamable_http_manager.py`'s
+  `StreamableHTTPSessionManager` already routes any request whose
+  `MCP-Protocol-Version` header isn't a legacy (2025-*) handshake version
+  straight to a self-contained single-exchange handler — no
+  `initialize`, no session id — regardless of any flag; that part needed
+  no code change at all. What the legacy stateful path (session id minted
+  on `initialize`, echoed via `Mcp-Session-Id`) needed was one explicit
+  opt-out: `stateless_http=True` on `streamable_http_app()`, which routes
+  *every* request, including old-protocol ones, through the same
+  no-session path. Shipped in branch `mcp-stateless-spec`: that flag, plus
+  deleting the `/sse` transport and the `--mcp-transport {http,sse,both}`
+  flag entirely (a deliberate choice, not forced by the spec's 12-month
+  legacy-transport deprecation window — nothing about this bridge's own
+  tool implementations depends on session state, since the only real state
+  is `SerialLink` owning the board, independent of any MCP session). Known
+  breaking change, accepted: a legacy client that negotiates via
+  `initialize` and assumes that state persists across later requests will
+  no longer work, since `stateless_http=True` gives every HTTP request an
+  unrelated fresh connection. New `Mcp-Method`/`Mcp-Name` request headers
+  (routing headers, not response headers — no CORS `expose_headers` change
+  needed) and the `Mcp-Param-*` mechanism are part of the same spec
+  revision, confirmed present in `mcp/shared/inbound.py`. Left for later:
+  interactive mid-execution input (nothing in this server needs it today,
+  but Phase II's debug stub plausibly could) moved from a stream to MRTR in
+  this spec revision — a `resultType: "input_required"` result plus a
+  retry carrying `inputResponses`, confirmed present as
+  `mcp_types.InputRequiredResult` / `mcp/client/_input_required.py` in the
+  installed SDK, worth reusing rather than reinventing whenever Phase II
+  gets there.
+
+- **Try Z88DK for on-host cross-compilation.** Logged 2026-08-15, from
+  RC2014Z80's wiki
+  (<https://github.com/RC2014Z80/RC2014/wiki/Using-Z88DK>). Z88DK builds
+  Z80 binaries on the host (`zcc +rc2014 -subtype=cpm -clib=sdcc_iy -SO3
+  prog.c -o prog.com`) instead of compiling/assembling on-device, which
+  is the current path — `ZAS.COM` at this repo's root is the on-device
+  assembler already in use (e.g. `H:ZAS MANDEL_Z.ASM` in a real bridge
+  session's log). Worth comparing on a real workload before adopting it
+  for anything beyond one-off experiments: binary size, runtime speed,
+  and the actual end-to-end edit/rebuild loop time (host cross-compile +
+  `rc2014_upload` vs. on-device assemble). `-subtype=cpm` is the relevant
+  target for this board's ZSDOS environment; the wiki's other `+rc2014`
+  subtypes (`basic`, `acia`/`sio`/`uart`, the `85`-suffixed 8085
+  variants) don't apply here. Not yet installed anywhere in this toolbox.
+
 ## Open questions for next discussion
 
 - Does any path exist to reach the loader's command parser again *without

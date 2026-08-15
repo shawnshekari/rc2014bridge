@@ -1,8 +1,10 @@
 """
 Model Context Protocol (MCP) server for the RC2014 bridge - the only control
-surface. Serves streamable HTTP at /mcp (the current spec transport) and the
-older SSE transport at /sse from one uvicorn instance, bound to 0.0.0.0:8014
-by default.
+surface. Serves the stateless streamable HTTP transport (protocol 2026-07-28
+and later) at /mcp from one uvicorn instance, bound to 0.0.0.0:8014 by
+default. Every request is self-contained - no initialize handshake, no
+Mcp-Session-Id, no persistent connection - so there is no legacy SSE
+transport to maintain either.
 
 The tool surface is built around rc2014_run_command: one call sends a command,
 waits for the CP/M prompt to come back, and returns just that command's output.
@@ -213,12 +215,10 @@ def _render_hardware_doc(info: dict) -> str:
 
 
 class McpServer:
-    def __init__(self, link, host: str = "0.0.0.0", port: int = 8014,
-                 transport: str = "both"):
+    def __init__(self, link, host: str = "0.0.0.0", port: int = 8014):
         self.link = link
         self.host = host
         self.port = port
-        self.transport = transport
         self._server_thread: Optional[threading.Thread] = None
         self._uvicorn: Optional[uvicorn.Server] = None
 
@@ -514,30 +514,6 @@ class McpServer:
             return await self._with_progress(ctx, link.scan_drives)
 
         @self.mcp.tool(annotations=ToolAnnotations(
-            title="Calibrate serial pacing", read_only_hint=False, destructive_hint=True))
-        async def rc2014_calibrate_pacing(ctx: Context, dest_drive: str = "",
-                                          test_bytes: int = 16384) -> dict:
-            """Measure the fastest XMODEM write pacing this board accepts.
-
-            The safe defaults were derived on a 7.4MHz Z80 behind an external UART
-            and run the line at roughly 5% of its rate. Faster boards tolerate far
-            more; this finds out empirically, accepting a setting only when a file
-            survives a round trip byte-for-byte, and records it for future runs.
-
-            Takes a few minutes and writes a temporary file to a scratch drive
-            (the volatile RAM disk by default). Worth running once per machine, and
-            before any long transfer such as a ROM image. Keep test_bytes >= 16384:
-            each transfer carries ~15s of fixed cost, so a smaller sample measures
-            that overhead rather than the pacing.
-            Requires the machine to be at a CP/M prompt.
-            """
-            logger.info("MCP Tool called: rc2014_calibrate_pacing(dest_drive=%r, test_bytes=%d)",
-                        dest_drive, test_bytes)
-            return await self._with_progress(ctx, link.calibrate_pacing,
-                                             dest_drive=dest_drive or None,
-                                             test_bytes=test_bytes)
-
-        @self.mcp.tool(annotations=ToolAnnotations(
             title="Run SURVEY", read_only_hint=True))
         def rc2014_survey() -> dict:
             """Run RomWBW's SURVEY and return the system report, structured.
@@ -573,25 +549,6 @@ class McpServer:
             """
             logger.info("MCP Tool called: rc2014_reboot()")
             return link.reboot()
-
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Enable or disable Pixel-Stream mode", read_only_hint=False))
-        def rc2014_enable_pixel_stream(enabled: bool = True) -> dict:
-            """Enable or disable the Mandel Pixel-Stream binary decoder mode.
-
-            When enabled, incoming binary pixel data is intercepted and decoded
-            into pixel frames for GUI/Pygame visualization.
-            """
-            logger.info("MCP Tool called: rc2014_enable_pixel_stream(enabled=%s)", enabled)
-            link.enable_pixel_stream(enabled)
-            return {"ok": True, "mode": getattr(link, "_mode", "terminal")}
-
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Get Mandel pixel frame data", read_only_hint=True, idempotent_hint=True))
-        def rc2014_get_pixel_frame() -> dict:
-            """Get snapshot of current decoded Mandel pixel frame and state."""
-            logger.info("MCP Tool called: rc2014_get_pixel_frame()")
-            return link.get_pixel_frame()
 
         # Low-level transfer escape hatches: these assume you have already armed
         # XM on the board yourself. Prefer rc2014_upload / rc2014_download.
@@ -631,17 +588,13 @@ class McpServer:
             allowed_origins=["*"],
         )
 
-        if self.transport == "sse":
-            app = self.mcp.sse_app(host=self.host, transport_security=security)
-        else:
-            # The streamable HTTP app carries the session-manager lifespan that
-            # /mcp requires, so it has to be the base app. The SSE routes are
-            # self-contained and need no lifespan of their own, so they can be
-            # appended onto it to serve both transports from one server.
-            app = self.mcp.streamable_http_app(host=self.host, transport_security=security)
-            if self.transport == "both":
-                sse_app = self.mcp.sse_app(host=self.host, transport_security=security)
-                app.router.routes.extend(sse_app.router.routes)
+        # stateless_http=True: every request gets its own fresh transport and
+        # connection, for every protocol version - no Mcp-Session-Id is ever
+        # minted or expected. 2026-07-28+ clients already route to the
+        # single-exchange handler unconditionally on protocol version; this
+        # flag is what removes the legacy stateful path for everything else.
+        app = self.mcp.streamable_http_app(
+            host=self.host, stateless_http=True, transport_security=security)
 
         app.add_middleware(
             CORSMiddleware,
@@ -649,26 +602,16 @@ class McpServer:
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
-            # Custom response headers are invisible to browser JS unless listed
-            # here - the Fetch spec only exposes a small safelist by default.
-            # Streamable HTTP clients read the session id off this header on
-            # the initialize response and must echo it back on every request
-            # after; without this, a browser-based client gets a session id
-            # from curl/Node but never sees one, and its next POST comes back
-            # 400 "Missing session ID".
-            expose_headers=["mcp-session-id"],
         )
         return app
 
     def endpoints(self) -> list[str]:
-        paths = {"http": ["/mcp"], "sse": ["/sse"], "both": ["/mcp", "/sse"]}[self.transport]
-        return [f"http://{self.host}:{self.port}{p}" for p in paths]
+        return [f"http://{self.host}:{self.port}/mcp"]
 
     def start(self):
         def _run_server():
             try:
-                logger.info("Starting MCP server on %s:%d (transport=%s)",
-                            self.host, self.port, self.transport)
+                logger.info("Starting MCP server on %s:%d", self.host, self.port)
                 config = uvicorn.Config(self._build_app(), host=self.host,
                                         port=self.port, log_level="info")
                 self._uvicorn = uvicorn.Server(config)
