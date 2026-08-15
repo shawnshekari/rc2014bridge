@@ -569,11 +569,13 @@ def _classify_drive_purpose(drive: str, files: list[str], device_map: str = "",
 
 
 def list_serial_ports() -> list[str]:
-    """Device paths of currently-attached serial adapters, for the GUI
-    Settings screen's port dropdown. Best-effort: an empty result just means
-    the picker falls back to whatever port is already configured."""
+    """Device paths of currently-attached USB serial adapters, for the GUI
+    Settings screen's port dropdown. Filtered to ports with a USB vendor/product
+    ID so e.g. Linux's ttyS0-ttyS31 legacy (non-USB) serial ports don't flood
+    the list. Best-effort: an empty result just means the picker falls back to
+    whatever port is already configured."""
     try:
-        return sorted(p.device for p in serial.tools.list_ports.comports())
+        return sorted(p.device for p in serial.tools.list_ports.comports() if p.vid is not None)
     except Exception:
         logger.exception("Failed to enumerate serial ports")
         return []
@@ -595,6 +597,37 @@ def probe_serial_connection(port: str, baud: int, rtscts: bool = False) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+class _DisconnectedSerial:
+    """Stand-in for serial.Serial used when the configured port can't be
+    opened at startup (e.g. a re-plugged FTDI adapter renumbered
+    ttyUSB0 -> ttyUSB1). Deliberately doesn't call serial.Serial() itself -
+    that constructor is exactly what just failed, so building the
+    placeholder through it too would just fail again. Gives SerialLink a
+    real object to hold as self._ser (rather than None) so attribute
+    access like .rtscts keeps working everywhere unchanged; only the
+    is_open-gated call sites (_read_loop, _write_raw/_write_paced) need to
+    know the difference. reconfigure() is what recovers from here - it
+    opens a real serial.Serial and swaps it in."""
+
+    def __init__(self, port: str, baudrate: int, rtscts: bool):
+        self.port = port
+        self.baudrate = baudrate
+        self.rtscts = rtscts
+        self.is_open = False
+
+    def close(self):
+        pass
+
+    def write(self, data: bytes) -> int:
+        raise serial.PortNotOpenError()
+
+    def read(self, size: int = 1) -> bytes:
+        raise serial.PortNotOpenError()
+
+    def flush(self):
+        pass
+
+
 class SerialLink:
     def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 48,
                  hw_info_file: str = "hardware_info.json",
@@ -614,8 +647,14 @@ class SerialLink:
         self._last_garbage_recovery_at = 0.0
         self.cols, self.rows = cols, rows
         self.hw_info_file = hw_info_file
-        self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
-                                   stopbits=1, timeout=0.1, rtscts=rtscts)
+        try:
+            self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
+                                       stopbits=1, timeout=0.1, rtscts=rtscts)
+        except (serial.SerialException, OSError) as e:
+            logger.warning("Could not open serial port %r: %s - starting "
+                            "disconnected; use Connection Settings to pick "
+                            "a different port.", port, e)
+            self._ser = _DisconnectedSerial(port, baudrate=baud, rtscts=rtscts)
         self._write_lock = threading.Lock()
 
         self._screen = pyte.HistoryScreen(cols, rows, history=1000)
@@ -714,6 +753,10 @@ class SerialLink:
     @property
     def rtscts(self) -> bool:
         return self._ser.rtscts
+
+    @property
+    def is_connected(self) -> bool:
+        return self._ser.is_open
 
     def is_transferring(self) -> bool:
         """True while XMODEM owns the wire. Cheap enough to call per keystroke."""
@@ -1321,6 +1364,13 @@ class SerialLink:
         while not self._stop.is_set():
             ser = self._ser
             epoch = self._reinit_epoch
+            if not ser.is_open:
+                # Started (or left) disconnected - nothing to read yet.
+                # Poll rather than exit, so a later reconfigure() swapping
+                # in an opened Serial is picked up without needing to
+                # restart this thread.
+                time.sleep(0.2)
+                continue
             try:
                 data = ser.read(4096)
             except Exception as e:
@@ -1438,6 +1488,8 @@ class SerialLink:
     def _write_raw(self, data: bytes):
         self._last_tx_time = time.time()
         with self._write_lock:
+            if not self._ser.is_open:
+                return
             self._ser.write(data)
             self._ser.flush()
 
@@ -1451,6 +1503,8 @@ class SerialLink:
             chunk, delay = self.xmodem_pacing
         self._last_tx_time = time.time()
         with self._write_lock:
+            if not self._ser.is_open:
+                return
             for i in range(0, len(data), chunk):
                 self._ser.write(data[i:i + chunk])
                 if i + chunk < len(data) and delay > 0:
@@ -1571,6 +1625,7 @@ class SerialLink:
                 "cols": self.cols, "rows": self.rows, "runs": runs,
                 "history_count": history_count, "scroll_offset": offset,
                 "port": self.port, "baud": self.baud, "mode": current_mode,
+                "connected": self._ser.is_open,
                 "rx_active": rx_active, "tx_active": tx_active,
                 "system_state": self._system_state, "last_prompt": self._last_prompt,
                 "current_op": self._current_op,
