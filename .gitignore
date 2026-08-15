@@ -7,4 +7,5 @@ __pycache__/
 *.rom
 *.log
 hardware_info.json
+rc2014bridge.ini
 .vscode/

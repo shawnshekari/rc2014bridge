@@ -24,6 +24,9 @@ import time
 import pygame
 from pygame._sdl2.video import Renderer, Texture, Window
 
+from rc2014bridge import config as bridge_config
+from rc2014bridge.link import list_serial_ports, probe_serial_connection
+
 FG = (110, 255, 110)
 BG = (10, 12, 10)
 CURSOR = (110, 255, 110)
@@ -139,6 +142,12 @@ def _key_to_bytes(event) -> bytes:
 TOP_MENU_HEIGHT = 32
 STATUS_BAR_HEIGHT = 32
 
+# Presets offered in the Settings screen's baud dropdown. Standard rates a
+# RC2014 UART (Z80 SIO/ACIA or 16550-alike) can plausibly be run at; any
+# other rate is still reachable via --baud or the config file, this is just
+# convenient presets for the common ones.
+BAUD_CHOICES = (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400)
+
 MENU_DATA = [
     {
         "title": "File",
@@ -163,7 +172,71 @@ MENU_DATA = [
             {"label": "Reset Scrollback (Shift+End)", "action": "RESET_SCROLLBACK"},
         ],
     },
+    {
+        "title": "Settings",
+        "items": [
+            {"label": "Connection Settings... (F8)", "action": "SHOW_SETTINGS"},
+        ],
+    },
 ]
+
+
+def _settings_modal_layout(screen_w: int, screen_h: int) -> dict:
+    """Rects for the Connection Settings modal - shared between the click
+    handler and the renderer so hit-testing and drawing never drift apart.
+
+    Column/button widths are sized for the longest label text they actually
+    hold ("Flow Control (RTS/CTS):" at ~230px, "Apply & Reconnect" at
+    ~171px in the 16pt bold monospace menu/status font), plus padding -
+    not guessed round numbers, which is what let the label and button text
+    overlap their neighbors before.
+    """
+    box_w, box_h = min(600, screen_w - 20), min(300, screen_h - 40)
+    box_x = (screen_w - box_w) // 2
+    box_y = (screen_h - box_h) // 2
+    field_x = box_x + 250
+    field_w = box_w - 250 - 16
+
+    port_field = pygame.Rect(field_x, box_y + 44, field_w, 26)
+    baud_field = pygame.Rect(field_x, box_y + 78, field_w, 26)
+    rtscts_box = pygame.Rect(field_x, box_y + 112, 20, 20)
+
+    btn_h, gap = 28, 10
+    test_btn = pygame.Rect(box_x + 12, box_y + box_h - btn_h - 12, 180, btn_h)
+    apply_btn = pygame.Rect(test_btn.right + gap, test_btn.y, 200, btn_h)
+    cancel_btn = pygame.Rect(apply_btn.right + gap, test_btn.y, 100, btn_h)
+
+    return {
+        "box": pygame.Rect(box_x, box_y, box_w, box_h),
+        "port_field": port_field,
+        "baud_field": baud_field,
+        "rtscts_box": rtscts_box,
+        "test_btn": test_btn,
+        "apply_btn": apply_btn,
+        "cancel_btn": cancel_btn,
+    }
+
+
+def _dropdown_option_rects(anchor: "pygame.Rect", options: list) -> list:
+    """One 24px-tall rect per option, stacked directly below `anchor`."""
+    return [pygame.Rect(anchor.x, anchor.bottom + i * 24, anchor.w, 24) for i in range(len(options))]
+
+
+def _draw_dropdown_list(surface, anchor, options: list, current_str: str, item_font):
+    rects = _dropdown_option_rects(anchor, options)
+    if not rects:
+        return
+    list_rect = pygame.Rect(anchor.x, anchor.bottom, anchor.w, rects[-1].bottom - anchor.bottom)
+    pygame.draw.rect(surface, (24, 28, 34), list_rect)
+    pygame.draw.rect(surface, (60, 75, 95), list_rect, width=1)
+    mx, my = pygame.mouse.get_pos()
+    for opt, r in zip(options, rects):
+        hover = r.collidepoint(mx, my)
+        if hover:
+            pygame.draw.rect(surface, (45, 95, 165), r)
+        color = (255, 255, 255) if (hover or str(opt) == current_str) else (200, 215, 230)
+        img = item_font.render(f" {opt}", True, color)
+        surface.blit(img, (r.x + 4, r.y + 3))
 
 
 def _open_system_file_dialog(mode: str = "open", title: str = "Select File") -> str | None:
@@ -355,7 +428,7 @@ def window_title(link, base: str = "RC2014 Bridge") -> str:
     return f"{base} - {machine}" if machine else f"{base} - {link.port}"
 
 
-def run(link, title: str = "RC2014 Bridge"):
+def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str = "RC2014 Bridge"):
     pygame.init()
     caption = window_title(link, title)
     pygame.display.set_caption(caption)
@@ -380,6 +453,18 @@ def run(link, title: str = "RC2014 Bridge"):
     toast_expires = 0.0
     running = True
 
+    # Connection Settings modal state. settings_port/_baud/_rtscts are the
+    # in-progress edits (only committed to the live link on Apply); the
+    # dropdowns are mutually exclusive so at most one is open at a time.
+    show_settings_modal = False
+    settings_port = link.port
+    settings_baud = link.baud
+    settings_rtscts = getattr(link, "rtscts", False)
+    settings_ports_cache: list[str] = []
+    settings_port_open = False
+    settings_baud_open = False
+    settings_status = ("", None)  # (message, ok: True/False/None-in-progress)
+
     # Each new Mandel pixel-stream render (detected via a render_id change)
     # gets its own popup window - see PixelStreamWindow's docstring.
     # Seeded from the decoder's current render_id (starts at 1, not 0/None,
@@ -392,6 +477,42 @@ def run(link, title: str = "RC2014 Bridge"):
         nonlocal toast_text, toast_expires
         toast_text = text
         toast_expires = time.time() + seconds
+
+    def _test_settings_connection(port: str, baud: int, rtscts: bool):
+        nonlocal settings_status
+        settings_status = ("Testing...", None)
+
+        def _worker():
+            nonlocal settings_status
+            res = probe_serial_connection(port, baud, rtscts)
+            if res.get("ok"):
+                settings_status = (f"OK: {port} @ {baud} baud opened successfully", True)
+            else:
+                settings_status = (f"Failed: {res.get('error', 'unknown error')}", False)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_settings(port: str, baud: int, rtscts: bool):
+        nonlocal settings_status
+        settings_status = ("Reconnecting...", None)
+
+        def _on_done(res: dict):
+            nonlocal settings_status
+            if res.get("ok"):
+                settings_status = (f"Connected: {res['port']} @ {res['baud']} baud", True)
+                bridge_config.update_value(config_path, "serial", "port", res["port"])
+                bridge_config.update_value(config_path, "serial", "baud", str(res["baud"]))
+                bridge_config.update_value(config_path, "serial", "rtscts", "true" if res["rtscts"] else "false")
+                _show_toast(f"Reconnected at {res['port']} @ {res['baud']} baud")
+            else:
+                error = res.get("error", "unknown error")
+                settings_status = (f"Failed: {error}", False)
+                # The modal closes as soon as Apply is clicked (reconnect
+                # happens in the background), so a failure needs a toast too -
+                # settings_status alone would go unseen.
+                _show_toast(f"Reconnect failed: {error}", 6.0)
+
+        link.reconfigure_async(port=port, baud=baud, rtscts=rtscts, callback=_on_done)
 
     def _on_xmodem_done(res: dict):
         if res.get("ok"):
@@ -416,6 +537,8 @@ def run(link, title: str = "RC2014 Bridge"):
 
     def _trigger_action(action: str):
         nonlocal prompt_mode, prompt_text, scroll_offset, running, active_menu_idx, show_reboot_modal, show_hw_info_modal, toast_text, toast_expires
+        nonlocal show_settings_modal, settings_port, settings_baud, settings_rtscts
+        nonlocal settings_ports_cache, settings_port_open, settings_baud_open, settings_status
         active_menu_idx = None
         if action == "PROMPT_SEND":
             def _send_worker():
@@ -454,6 +577,17 @@ def run(link, title: str = "RC2014 Bridge"):
                 _show_toast("Pixel-Stream mode DISABLED (terminal restored)")
         elif action == "RESET_SCROLLBACK":
             scroll_offset = 0
+        elif action == "SHOW_SETTINGS":
+            settings_port = link.port
+            settings_baud = link.baud
+            settings_rtscts = getattr(link, "rtscts", False)
+            settings_ports_cache = list_serial_ports()
+            if settings_port not in settings_ports_cache:
+                settings_ports_cache = settings_ports_cache + [settings_port]
+            settings_port_open = False
+            settings_baud_open = False
+            settings_status = ("", None)
+            show_settings_modal = True
         elif action == "QUIT":
             running = False
 
@@ -487,6 +621,45 @@ def run(link, title: str = "RC2014 Bridge"):
                     if my < TOP_MENU_HEIGHT + 36:
                         _do_reboot()
                     show_reboot_modal = False
+                    continue
+
+                if show_settings_modal:
+                    layout = _settings_modal_layout(screen_w, screen_h)
+
+                    if settings_port_open:
+                        opt_rects = _dropdown_option_rects(layout["port_field"], settings_ports_cache)
+                        for i, r in enumerate(opt_rects):
+                            if r.collidepoint(mx, my):
+                                settings_port = settings_ports_cache[i]
+                                break
+                        settings_port_open = False
+                        continue
+                    if settings_baud_open:
+                        opt_rects = _dropdown_option_rects(layout["baud_field"], BAUD_CHOICES)
+                        for i, r in enumerate(opt_rects):
+                            if r.collidepoint(mx, my):
+                                settings_baud = BAUD_CHOICES[i]
+                                break
+                        settings_baud_open = False
+                        continue
+
+                    if layout["port_field"].collidepoint(mx, my):
+                        settings_port_open = True
+                        settings_baud_open = False
+                    elif layout["baud_field"].collidepoint(mx, my):
+                        settings_baud_open = True
+                        settings_port_open = False
+                    elif layout["rtscts_box"].collidepoint(mx, my):
+                        settings_rtscts = not settings_rtscts
+                    elif layout["test_btn"].collidepoint(mx, my):
+                        _test_settings_connection(settings_port, settings_baud, settings_rtscts)
+                    elif layout["apply_btn"].collidepoint(mx, my):
+                        _apply_settings(settings_port, settings_baud, settings_rtscts)
+                        show_settings_modal = False
+                    elif layout["cancel_btn"].collidepoint(mx, my):
+                        show_settings_modal = False
+                    elif not layout["box"].collidepoint(mx, my):
+                        show_settings_modal = False
                     continue
 
                 clicked_menu_item = False
@@ -536,6 +709,11 @@ def run(link, title: str = "RC2014 Bridge"):
                     show_reboot_modal = False
                     continue
 
+                if show_settings_modal:
+                    if event.key == pygame.K_ESCAPE:
+                        show_settings_modal = False
+                    continue
+
                 if prompt_mode is not None:
                     if event.key == pygame.K_ESCAPE:
                         prompt_mode = None
@@ -576,6 +754,9 @@ def run(link, title: str = "RC2014 Bridge"):
                     continue
                 elif event.key == pygame.K_F7:
                     _trigger_action("TOGGLE_PIXEL_STREAM")
+                    continue
+                elif event.key == pygame.K_F8:
+                    _trigger_action("SHOW_SETTINGS")
                     continue
 
                 if event.mod & pygame.KMOD_SHIFT:
@@ -877,6 +1058,79 @@ def run(link, title: str = "RC2014 Bridge"):
                 surface.blit(lbl_img, (box_x + 12, y_curr))
                 surface.blit(purp_img, (box_x + 12 + lbl_img.get_width() + 10, y_curr))
                 y_curr += 22
+
+        # --------------------------------------------------------------
+        # 5b. Render Connection Settings Modal Overlay (if active)
+        # --------------------------------------------------------------
+        if show_settings_modal:
+            layout = _settings_modal_layout(screen_w, screen_h)
+            box = layout["box"]
+
+            pygame.draw.rect(surface, (20, 24, 30), box)
+            pygame.draw.rect(surface, (60, 110, 180), box, width=2)
+
+            hdr_rect = pygame.Rect(box.x, box.y, box.w, 32)
+            pygame.draw.rect(surface, (30, 50, 80), hdr_rect)
+            pygame.draw.line(surface, (60, 110, 180), (box.x, box.y + 31), (box.x + box.w, box.y + 31))
+            hdr_img = menu_font.render(" Connection Settings ", True, (255, 255, 255))
+            surface.blit(hdr_img, (box.x + 8, box.y + 6))
+            close_hint = status_font.render("[Esc to Close]", True, (180, 210, 240))
+            surface.blit(close_hint, (box.x + box.w - close_hint.get_width() - 10, box.y + 6))
+
+            def _settings_label(text, y):
+                img = menu_font.render(text, True, (140, 180, 220))
+                surface.blit(img, (box.x + 12, y + 4))
+
+            for field_rect, value in (
+                (layout["port_field"], settings_port),
+                (layout["baud_field"], settings_baud),
+            ):
+                pygame.draw.rect(surface, (35, 40, 48), field_rect)
+                pygame.draw.rect(surface, (80, 95, 115), field_rect, width=1)
+                val_img = font.render(f" {value}", True, (255, 255, 255))
+                surface.blit(val_img, (field_rect.x + 4, field_rect.y + 3))
+                arrow_img = menu_font.render("v", True, (170, 185, 200))
+                surface.blit(arrow_img, (field_rect.right - 20, field_rect.y + 3))
+
+            _settings_label("Serial Port:", layout["port_field"].y)
+            _settings_label("Baud Rate:", layout["baud_field"].y)
+            _settings_label("Flow Control (RTS/CTS):", layout["rtscts_box"].y - 2)
+
+            rtscts_box = layout["rtscts_box"]
+            pygame.draw.rect(surface, (35, 40, 48), rtscts_box)
+            pygame.draw.rect(surface, (80, 95, 115), rtscts_box, width=1)
+            if settings_rtscts:
+                pygame.draw.line(surface, (110, 255, 110), rtscts_box.topleft, rtscts_box.bottomright, width=2)
+                pygame.draw.line(surface, (110, 255, 110), rtscts_box.topright, rtscts_box.bottomleft, width=2)
+
+            status_msg, status_ok = settings_status
+            if status_msg:
+                if status_ok is True:
+                    status_color = (140, 220, 140)
+                elif status_ok is False:
+                    status_color = (240, 120, 110)
+                else:
+                    status_color = (255, 200, 120)
+                status_img = status_font.render(status_msg, True, status_color)
+                surface.blit(status_img, (box.x + 12, layout["test_btn"].y - 22))
+
+            for label, rect in (
+                ("Test Connection", layout["test_btn"]),
+                ("Apply & Reconnect", layout["apply_btn"]),
+                ("Cancel", layout["cancel_btn"]),
+            ):
+                hover = rect.collidepoint(mx, my)
+                pygame.draw.rect(surface, (45, 95, 165) if hover else (40, 46, 55), rect)
+                pygame.draw.rect(surface, (80, 95, 115), rect, width=1)
+                lbl_img = status_font.render(label, True, (255, 255, 255))
+                surface.blit(lbl_img, (rect.x + (rect.w - lbl_img.get_width()) // 2,
+                                        rect.y + (rect.h - lbl_img.get_height()) // 2))
+
+            # Dropdown overlays drawn last so they sit above the buttons/fields.
+            if settings_port_open:
+                _draw_dropdown_list(surface, layout["port_field"], settings_ports_cache, settings_port, font)
+            if settings_baud_open:
+                _draw_dropdown_list(surface, layout["baud_field"], list(BAUD_CHOICES), str(settings_baud), font)
 
         # --------------------------------------------------------------
         # 6. Render Notification Toast (if active)

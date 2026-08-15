@@ -2,6 +2,7 @@ import argparse
 import logging
 import sys
 
+from rc2014bridge import config as bridge_config
 from rc2014bridge.display import run as run_display
 from rc2014bridge.link import SerialLink
 from rc2014bridge.mcp_server import McpServer
@@ -10,35 +11,77 @@ DEFAULT_LOG = "rc2014bridge.log"
 DEFAULT_HW_INFO = "hardware_info.json"
 
 
+def _cfg_str(cfg: dict, key: str, fallback):
+    val = cfg.get(key)
+    return val if val else fallback
+
+
+def _cfg_int(cfg: dict, key: str, fallback: int) -> int:
+    val = cfg.get(key)
+    if not val:
+        return fallback
+    try:
+        return int(val)
+    except ValueError:
+        print(f"Config: {key}={val!r} is not an integer, using default {fallback}", file=sys.stderr)
+        return fallback
+
+
+def _cfg_bool(cfg: dict, key: str, fallback: bool) -> bool:
+    val = cfg.get(key)
+    if not val:
+        return fallback
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 def main():
+    # First pass just locates --config, so its contents can seed every other
+    # flag's default before the real parser (with --help, choices, etc.) is
+    # built. A flag given on the actual command line always wins over
+    # whatever the config file says - see the p.add_argument() calls below,
+    # which only use the config file to fill in `default=`.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=bridge_config.DEFAULT_CONFIG_PATH)
+    pre_args, _ = pre.parse_known_args()
+    cfg = bridge_config.load(pre_args.config)
+
     p = argparse.ArgumentParser(description="RC2014 serial bridge - GUI terminal + MCP server")
-    p.add_argument("--port", default="/dev/ttyUSB0")
-    p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--config", default=pre_args.config,
+                    help="Path to an INI config file providing defaults for the flags below "
+                         "(default: %(default)s; a missing file just means the built-in "
+                         "defaults apply). Any flag given on the command line overrides it.")
+    p.add_argument("--port", default=_cfg_str(cfg, "port", "/dev/ttyUSB0"))
+    p.add_argument("--baud", type=int, default=_cfg_int(cfg, "baud", 115200))
     # 160 columns is twice the console's own 80, which makes for a comfortably
     # wide window without shrinking the terminal or growing its height. The board
     # still emits 80-column output; the extra width just isn't used by it.
-    p.add_argument("--cols", type=int, default=160)
-    p.add_argument("--rows", type=int, default=48)
-    p.add_argument("--log-file", default=DEFAULT_LOG, help="Path to log file")
-    p.add_argument("--hw-info", default=DEFAULT_HW_INFO,
+    p.add_argument("--cols", type=int, default=_cfg_int(cfg, "cols", 160))
+    p.add_argument("--rows", type=int, default=_cfg_int(cfg, "rows", 48))
+    p.add_argument("--log-file", default=_cfg_str(cfg, "log-file", DEFAULT_LOG), help="Path to log file")
+    p.add_argument("--hw-info", default=_cfg_str(cfg, "hw-info", DEFAULT_HW_INFO),
                    help="Path to the captured hardware info JSON (default: %(default)s)")
-    p.add_argument("--mcp", action="store_true", default=True, help="Enable the MCP server (default: True)")
+    p.add_argument("--mcp", action="store_true", default=_cfg_bool(cfg, "mcp", True),
+                   help="Enable the MCP server (default: True)")
     p.add_argument("--no-mcp", dest="mcp", action="store_false", help="Disable the MCP server")
-    p.add_argument("--mcp-host", default="0.0.0.0", help="Host IP to bind the MCP server (default: %(default)s)")
-    p.add_argument("--mcp-port", type=int, default=8014, help="Port for the MCP server (default: %(default)s)")
-    p.add_argument("--mcp-transport", choices=["http", "sse", "both"], default="both",
+    p.add_argument("--mcp-host", default=_cfg_str(cfg, "mcp-host", "0.0.0.0"),
+                   help="Host IP to bind the MCP server (default: %(default)s)")
+    p.add_argument("--mcp-port", type=int, default=_cfg_int(cfg, "mcp-port", 8014),
+                   help="Port for the MCP server (default: %(default)s)")
+    p.add_argument("--mcp-transport", choices=["http", "sse", "both"],
+                   default=_cfg_str(cfg, "mcp-transport", "both"),
                    help="Serve streamable HTTP at /mcp, the older SSE at /sse, or both "
                         "(default: %(default)s)")
-    p.add_argument("--xmodem-pacing", metavar="CHUNK:DELAY_MS",
+    p.add_argument("--xmodem-pacing", metavar="CHUNK:DELAY_MS", default=_cfg_str(cfg, "xmodem-pacing", None),
                    help="Override XMODEM write pacing, e.g. 128:2. Default: whatever "
                         "rc2014_calibrate_pacing last proved on this machine, else 8:10")
-    p.add_argument("--text-pacing", metavar="CHUNK:DELAY_MS",
+    p.add_argument("--text-pacing", metavar="CHUNK:DELAY_MS", default=_cfg_str(cfg, "text-pacing", None),
                    help="Override keystroke/command write pacing, e.g. 8:5 (default 1:15)")
-    p.add_argument("--rtscts", action="store_true",
+    p.add_argument("--rtscts", action="store_true", default=_cfg_bool(cfg, "rtscts", False),
                    help="Enable hardware RTS/CTS flow control on the serial port. "
                         "Experimental: only meaningful if both the board and the cable "
                         "actually wire CTS/RTS through (default: off)")
-    p.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG level logging")
+    p.add_argument("--verbose", "-v", action="store_true", default=_cfg_bool(cfg, "verbose", False),
+                   help="Enable DEBUG level logging")
     args = p.parse_args()
 
     def _pacing(value):
@@ -76,7 +119,7 @@ def main():
             logging.warning("Failed to start MCP server: %s", e)
 
     try:
-        run_display(link)
+        run_display(link, config_path=args.config)
     finally:
         if mcp_server:
             mcp_server.stop()

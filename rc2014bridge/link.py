@@ -10,8 +10,11 @@ Two ways incoming bytes get interpreted, controlled by self._mode:
   - "xmodem": routed byte-by-byte to a queue that xmodem_send/receive
     consume directly, bypassing the terminal emulator entirely.
 
-The port itself is opened once and held for the object's whole lifetime;
-switching modes never closes or reacquires it.
+The port is normally opened once and held for the object's whole lifetime;
+switching modes never closes or reacquires it. reconfigure() is the one
+deliberate exception - it closes and reopens the port (e.g. for a different
+baud rate, device path, or RTS/CTS setting) at the user's request from the
+GUI's Settings screen.
 
 Operations that own the wire for more than one write - run_command(),
 upload(), download(), the XMODEM transfers, scan_drives(), reboot() - are
@@ -37,6 +40,7 @@ import time
 
 import pyte
 import serial
+import serial.tools.list_ports
 
 from rc2014bridge.pixel_stream import VERSION_BANNER, PixelStreamDecoder
 
@@ -485,6 +489,33 @@ def _classify_drive_purpose(drive: str, files: list[str], device_map: str = "",
     return f"General Application / Data Volume{suffix}"
 
 
+def list_serial_ports() -> list[str]:
+    """Device paths of currently-attached serial adapters, for the GUI
+    Settings screen's port dropdown. Best-effort: an empty result just means
+    the picker falls back to whatever port is already configured."""
+    try:
+        return sorted(p.device for p in serial.tools.list_ports.comports())
+    except Exception:
+        logger.exception("Failed to enumerate serial ports")
+        return []
+
+
+def probe_serial_connection(port: str, baud: int, rtscts: bool = False) -> dict:
+    """Open `port` at `baud`/`rtscts` and immediately close it again, independent
+    of any existing SerialLink. Lets the GUI's Settings screen validate a
+    port/baud/rtscts combination (permissions, wrong device, port already in
+    use) before committing to it with SerialLink.reconfigure(). Named "probe"
+    rather than "test" so it doesn't look like a pytest test function to
+    anything that imports it into a test module's namespace."""
+    try:
+        probe = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
+                               stopbits=1, timeout=0.1, rtscts=rtscts)
+        probe.close()
+        return {"ok": True}
+    except (serial.SerialException, OSError) as e:
+        return {"ok": False, "error": str(e)}
+
+
 class SerialLink:
     def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 48,
                  hw_info_file: str = "hardware_info.json",
@@ -553,6 +584,11 @@ class SerialLink:
         self._hw_snapshot = json.dumps(self.hardware_info, sort_keys=True)
         self._boot_buffer = ""
 
+        # Bumped by reconfigure() each time it swaps in a freshly opened
+        # _ser. _read_loop compares against this to tell "port was closed
+        # out from under me on purpose" apart from a real disconnect.
+        self._reinit_epoch = 0
+
         self._stop = threading.Event()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -581,6 +617,10 @@ class SerialLink:
     @property
     def current_op(self) -> str:
         return self._current_op
+
+    @property
+    def rtscts(self) -> bool:
+        return self._ser.rtscts
 
     def is_transferring(self) -> bool:
         """True while XMODEM owns the wire. Cheap enough to call per keystroke."""
@@ -959,6 +999,47 @@ class SerialLink:
         self._save_hardware_info()
         return {"ok": True, "survey": parsed}
 
+    def reconfigure_async(self, port: str = None, baud: int = None, rtscts: bool = None, callback=None):
+        def _worker():
+            res = self.reconfigure(port=port, baud=baud, rtscts=rtscts)
+            if callback:
+                callback(res)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @_exclusive("reconfigure connection")
+    def reconfigure(self, port: str = None, baud: int = None, rtscts: bool = None) -> dict:
+        """Re-init the serial connection: closes the current port and opens
+        a new one, optionally at a different device path / baud rate / flow
+        control setting (any left as None keeps its current value). Used by
+        the GUI's Settings screen. @_exclusive so this can't run out from
+        under an in-flight XMODEM transfer or drive scan.
+        """
+        new_port = self.port if port is None else port
+        new_baud = self.baud if baud is None else baud
+        new_rtscts = self._ser.rtscts if rtscts is None else rtscts
+        try:
+            new_ser = serial.Serial(new_port, baudrate=new_baud, bytesize=8, parity="N",
+                                     stopbits=1, timeout=0.1, rtscts=new_rtscts)
+        except (serial.SerialException, OSError) as e:
+            logger.warning("reconfigure(port=%r, baud=%r, rtscts=%r) failed: %s",
+                            port, baud, rtscts, e)
+            return {"ok": False, "error": str(e)}
+
+        # Swap under _write_lock so an in-flight _write_raw()/_write_paced()
+        # (which read self._ser under the same lock) can't observe a
+        # half-updated state - it lands entirely on the old port or entirely
+        # on the new one, never a write() call split across the two.
+        with self._write_lock:
+            old_ser = self._ser
+            self._reinit_epoch += 1
+            self._ser = new_ser
+            self.port = new_port
+            self.baud = new_baud
+        old_ser.close()
+        logger.info("Serial connection reconfigured: %s @ %d baud, rtscts=%s", new_port, new_baud, new_rtscts)
+        return {"ok": True, "port": new_port, "baud": new_baud, "rtscts": new_rtscts}
+
     def close(self):
         self._stop.set()
         self._reader.join(timeout=1.0)
@@ -1036,9 +1117,25 @@ class SerialLink:
     # ------------------------------------------------------------------
     def _read_loop(self):
         while not self._stop.is_set():
+            ser = self._ser
+            epoch = self._reinit_epoch
             try:
-                data = self._ser.read(4096)
-            except serial.SerialException:
+                data = ser.read(4096)
+            except Exception as e:
+                # pyserial's read() isn't atomic about a concurrent close():
+                # depending on timing it raises SerialException, OSError, or
+                # (observed on POSIX) a bare TypeError from os.read() seeing
+                # fd=None mid-call. Anything here is treated as recoverable
+                # if reconfigure() is what caused it (epoch bumped); only a
+                # failure with no epoch change is a real disconnect.
+                if self._stop.is_set():
+                    break
+                if self._reinit_epoch != epoch:
+                    # reconfigure() closed this ser and swapped in a new one
+                    # while the read above was in flight - not a real
+                    # disconnect, loop back and read from the fresh self._ser.
+                    continue
+                logger.warning("Serial read failed on %s - reader thread stopping: %s", self.port, e)
                 break
             if not data:
                 continue

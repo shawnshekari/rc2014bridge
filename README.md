@@ -12,21 +12,39 @@ hardware).
 
 ## What it does
 
-- Owns the serial port permanently (replaces minicom), feeding incoming
+- **Owns the serial port permanently** (replaces minicom), feeding incoming
   bytes into an embedded [`pyte`](https://github.com/selectel/pyte)
   terminal emulator that tracks real screen state — a character grid and
   cursor position, not a raw byte blob.
-- Renders that screen in a pygame window and forwards local keystrokes to
+- **Renders that screen in a pygame window** and forwards local keystrokes to
   the port, same as any terminal program. Human typing is never gated on the
   agent's operation lock — except during an XMODEM transfer, where ordinary
   keys are held back (Ctrl-C and Ctrl-X always pass, so you can always
   cancel one).
-- Exposes an MCP server alongside the GUI, so a model can drive the exact
-  same session a human is watching.
-- Implements XMODEM send *and* receive from scratch — not a wrapper
+- **Exposes an MCP server alongside the GUI**, so a model can drive the exact
+  same session a human is watching — see [The MCP server](#the-mcp-server)
+  and its [tool table](#tools) (run commands, transfer files, scan drives,
+  survey hardware, reboot, and more).
+- **XMODEM send *and* receive**, implemented from scratch — not a wrapper
   around `sx`/minicom — because getting real file transfer working
   against actual RomWBW hardware surfaced quirks a generic wrapper
-  wouldn't (see below).
+  wouldn't (see [Real hardware bugs found building this](#real-hardware-bugs-found-building-this)).
+- **Hardware & Disk Info modal** (F5): captured RomWBW/CPU/memory config plus
+  a live drive catalogue from `rc2014_scan_drives`/`SURVEY`.
+- **Reboot** (F4), picking the right method for whatever state the machine
+  is currently in — CP/M, HBIOS, or the flash utility.
+- **Mandel Pixel-Stream rendering** (F7): auto-detects and decodes the
+  [Mandel Pixel-Stream protocol](protocol/DESIGN.md) on the wire, drawing
+  RGB output live as it streams in, with a standalone popup window per render.
+- **Connection Settings screen** (F8): pick the serial port from a
+  live-scanned dropdown, choose a baud rate and RTS/CTS, test a combination
+  before committing, and reconnect live without restarting — see
+  [Connection settings](#connection-settings).
+- **Config file** (`rc2014bridge.ini`), so the long list of CLI flags only
+  has to be set once — see [Config file](#config-file).
+- **Serial pacing calibration** (`rc2014_calibrate_pacing`): finds the
+  fastest XMODEM/keystroke pacing a given board actually accepts, proven
+  with a byte-exact round trip — see [Serial pacing](#serial-pacing).
 
 ## Screenshots
 
@@ -148,11 +166,68 @@ the **File > Quit** menu or close the window.
 
 **Nothing shows up on the screen?** Wrong baud rate or the board isn't
 actually booting — check with `--baud` (default `115200`) and make sure
-the board is powered. **Window doesn't open at all?** This is a GUI app,
-so it needs a desktop to open a window in — it won't work over a plain
-SSH session without X forwarding (`ssh -X`), and won't work in a
-container with no display. Read the error in the terminal you ran the
-command from; it'll say if that's the problem.
+the board is powered, or open **Settings > Connection Settings...** (F8)
+in the running app to try another rate without restarting. **Window
+doesn't open at all?** This is a GUI app, so it needs a desktop to open a
+window in — it won't work over a plain SSH session without X forwarding
+(`ssh -X`), and won't work in a container with no display. Read the error
+in the terminal you ran the command from; it'll say if that's the problem.
+
+## Connection settings
+
+**In the app:** **Settings > Connection Settings...** (F8) opens a screen
+with a dropdown of detected serial ports, a dropdown of common baud rates
+(1200 – 230400), and an RTS/CTS checkbox. **Test Connection** opens the
+chosen port/baud/rtscts combination and closes it again without touching
+the live connection, so you can sanity-check a setting before committing to
+it. **Apply & Reconnect** closes the current port and reopens it with the
+new settings (the XMODEM/drive-scan lock keeps this from firing mid-transfer)
+and writes the change back to the config file so a restart picks up the
+same settings automatically.
+
+**On the command line / in a config file:** `--port`, `--baud`, `--rtscts`.
+
+## Config file
+
+Every flag below can also be set once in an INI file instead of retyped on
+every launch. By default the app looks for `rc2014bridge.ini` in the
+current directory (override with `--config path/to/file.ini`); a missing
+file just means the built-in defaults apply. A flag given on the command
+line always overrides the config file.
+
+```ini
+[serial]
+port = /dev/ttyUSB0
+baud = 115200
+rtscts = false
+
+[display]
+cols = 160
+rows = 48
+
+[files]
+log-file = rc2014bridge.log
+hw-info = hardware_info.json
+
+[mcp]
+enabled = true
+host = 0.0.0.0
+port = 8014
+transport = both
+
+[pacing]
+xmodem-pacing =
+text-pacing =
+
+[logging]
+verbose = false
+```
+
+Section names are just for readability — every key is looked up by name
+regardless of which section it's under. The Settings screen's **Apply &
+Reconnect** writes `port`/`baud`/`rtscts` back into this file (creating it
+under `[serial]` if it doesn't exist yet) so the picked connection survives
+a restart; everything else here is only ever read, not written by the app.
 
 ## The MCP server
 
@@ -354,6 +429,7 @@ rc2014bridge/
                  XMODEM send/receive, upload/download composites
   mcp_server.py  MCP tools, resources, prompts; HTTP + SSE transports
   display.py     pygame rendering + keyboard forwarding
+  config.py      INI config file loading + surgical value updates
   app.py         entry point wiring the above together
 tests/
   fakes.py       FakeSerial - a loopback-capable pyserial stand-in

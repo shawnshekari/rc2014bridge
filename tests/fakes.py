@@ -3,6 +3,8 @@
 import threading
 import time
 
+import serial
+
 
 class FakeSerial:
     """Minimal pyserial stand-in.
@@ -18,6 +20,9 @@ class FakeSerial:
         self._lock = threading.Lock()
         self.peer: "FakeSerial | None" = None
         self.is_open = True
+        self.port = args[0] if args else kwargs.get("port")
+        self.baudrate = kwargs.get("baudrate")
+        self.rtscts = kwargs.get("rtscts", False)
         # Optional line-oriented device behaviour: called with each complete
         # CR-terminated line written to the port; whatever bytes it returns are
         # fed back as if the board had printed them. The line itself is echoed
@@ -35,6 +40,11 @@ class FakeSerial:
         return a, b
 
     def read(self, size: int = 1) -> bytes:
+        if not self.is_open:
+            # Mirrors real pyserial: reading a closed port raises rather than
+            # returning empty - lets tests exercise link.py's handling of a
+            # port closed out from under an in-flight read (see reconfigure()).
+            raise serial.SerialException("port closed")
         with self._lock:
             if self._rx:
                 data = bytes(self._rx[:size])
