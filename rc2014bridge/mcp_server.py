@@ -1,8 +1,10 @@
 """
 Model Context Protocol (MCP) server for the RC2014 bridge - the only control
-surface. Serves streamable HTTP at /mcp (the current spec transport) and the
-older SSE transport at /sse from one uvicorn instance, bound to 0.0.0.0:8014
-by default.
+surface. Serves the stateless streamable HTTP transport (protocol 2026-07-28
+and later) at /mcp from one uvicorn instance, bound to 0.0.0.0:8014 by
+default. Every request is self-contained - no initialize handshake, no
+Mcp-Session-Id, no persistent connection - so there is no legacy SSE
+transport to maintain either.
 
 The tool surface is built around rc2014_run_command: one call sends a command,
 waits for the CP/M prompt to come back, and returns just that command's output.
@@ -44,10 +46,12 @@ How to drive it:
   something - `^C` to break out of a program, `^X<PAUSE>^X` to abort a stuck
   XM transfer. It is the one tool allowed to run while something else owns the
   wire.
-- `rc2014_upload` / `rc2014_download` handle file transfer end to end - they
-  run XM on the board, transfer, and verify. Do not drive XM by hand.
-- `rc2014_read_text_file` / `rc2014_write_text_file` for text; they are cheaper
-  than a transfer but not byte-exact (TYPE expands tabs and stops at 0x1A).
+- `rc2014_upload` / `rc2014_download` handle file transfer end to end - content
+  in, content out. They zip, run XM, transfer, and verify; do not drive XM by
+  hand. `binary=false` (the default) handles text CRLF/EOF conversion for you.
+- `rc2014_read_text_file` is a cheaper alternative for a quick peek at a text
+  file, but not byte-exact (TYPE expands tabs and stops at 0x1A) - use
+  `rc2014_download` when the exact bytes matter.
 
 What to expect:
 - Filenames are CP/M 8.3 uppercase (`MBASIC.COM`, `DEMO.Z80`). Drives are `A:`
@@ -213,12 +217,10 @@ def _render_hardware_doc(info: dict) -> str:
 
 
 class McpServer:
-    def __init__(self, link, host: str = "0.0.0.0", port: int = 8014,
-                 transport: str = "both"):
+    def __init__(self, link, host: str = "0.0.0.0", port: int = 8014):
         self.link = link
         self.host = host
         self.port = port
-        self.transport = transport
         self._server_thread: Optional[threading.Thread] = None
         self._uvicorn: Optional[uvicorn.Server] = None
 
@@ -429,44 +431,61 @@ class McpServer:
 
         @self.mcp.tool(annotations=ToolAnnotations(
             title="Upload a file to the board", read_only_hint=False, destructive_hint=True))
-        async def rc2014_upload(ctx: Context, local_path: str, dest_drive: str = "",
-                                cpm_name: str = "", overwrite: bool = True) -> dict:
-            """Copy a file from this host to the RC2014, verifying it arrived.
+        async def rc2014_upload(ctx: Context, name: str, drive: str, user: int = 0,
+                                content: str = "", binary: bool = False,
+                                overwrite: bool = False) -> dict:
+            """Copy content to the RC2014, zipped over XMODEM, verifying it arrived.
 
-            Handles the whole sequence: runs XM on the board, transfers over XMODEM,
-            then confirms the file with DIR. Do NOT run 'XM R' yourself first.
+            Handles the whole sequence: zips content, runs XM on the board,
+            transfers, UNZIPs, confirms with DIR. Do NOT run 'XM R' yourself first.
 
-            local_path: file on the host running the bridge.
-            dest_drive: target drive such as 'B:' (default: the board's current drive).
-            cpm_name: 8.3 name on the board (default: derived from the local filename).
-            overwrite: XM refuses to write over an existing file, so an existing
-              target is erased first. Pass false to fail instead of replacing it.
+            name: 8.3 CP/M filename ONLY, e.g. 'HELLO.TXT' - no drive prefix
+              (unlike cpm_path-style tools such as rc2014_read_text_file).
+              Put the drive in `drive` instead.
+            drive: target drive, 'A'..'P'.
+            user: CP/M user area, 0-15 (default 0).
+            content: text, or base64 when binary=true. binary=false encodes as
+              latin-1 - characters outside it (em-dashes, curly quotes, most
+              non-ASCII text) are silently replaced with '?'. Use binary=true
+              (base64) for anything that must survive exactly.
+            binary: false (default) applies CP/M's CRLF + 0x1A EOF-marker
+              convention for text; true passes raw bytes through untouched.
+            overwrite: UNZIP (like XM) refuses to replace an existing file, so
+              an existing target is erased first. Pass false to fail instead.
             Requires the machine to be at a CP/M prompt.
             """
-            logger.info("MCP Tool called: rc2014_upload(local_path=%r, dest_drive=%r, "
-                        "cpm_name=%r, overwrite=%s)", local_path, dest_drive, cpm_name, overwrite)
+            logger.info("MCP Tool called: rc2014_upload(name=%r, drive=%r, user=%d, "
+                        "binary=%s, overwrite=%s)", name, drive, user, binary, overwrite)
             return await self._with_progress(
-                ctx, link.upload, local_path, dest_drive=dest_drive or None,
-                cpm_name=cpm_name or None, overwrite=overwrite)
+                ctx, link.upload, name, drive, user=user, content=content,
+                binary=binary, overwrite=overwrite)
 
         @self.mcp.tool(annotations=ToolAnnotations(
             title="Download a file from the board", read_only_hint=False, destructive_hint=True))
-        async def rc2014_download(ctx: Context, cpm_path: str, local_path: str = "") -> dict:
-            """Copy a file from the RC2014 to this host, returning its sha256.
+        async def rc2014_download(ctx: Context, name: str, drive: str, user: int = 0,
+                                  binary: bool = False) -> dict:
+            """Copy a file off the RC2014 over XMODEM (1K blocks), content inline.
 
-            Handles the whole sequence: runs XM on the board, receives over XMODEM,
-            writes the host file. Do NOT run 'XM S' yourself first. Overwrites
-            local_path if it exists.
+            Handles the whole sequence: runs XM on the board, receives, returns the
+            content and its sha256. Do NOT run 'XM S' yourself first.
 
-            cpm_path: file on the board, e.g. 'B:LEDSHOW.COM'.
-            local_path: host destination (default: the CP/M name in the bridge's
-            working directory).
+            name: 8.3 CP/M filename ONLY on the board, e.g. 'LEDSHOW.COM' - no
+              drive prefix (unlike cpm_path-style tools such as
+              rc2014_read_text_file). Put the drive in `drive` instead.
+            drive: source drive, 'A'..'P'.
+            user: CP/M user area, 0-15 (default 0).
+            binary: false (default) returns text (latin-1 decoded - anything
+              outside it comes back mangled, matching how it was written);
+              true returns base64, byte-exact only to the file's 128-byte
+              CP/M record size (CP/M has no sub-record length anywhere, so a
+              file whose true length isn't a multiple of 128 may come back
+              with trailing padding).
             Requires the machine to be at a CP/M prompt.
             """
-            logger.info("MCP Tool called: rc2014_download(cpm_path=%r, local_path=%r)",
-                        cpm_path, local_path)
+            logger.info("MCP Tool called: rc2014_download(name=%r, drive=%r, user=%d, "
+                        "binary=%s)", name, drive, user, binary)
             return await self._with_progress(
-                ctx, link.download, cpm_path, local_path=local_path or None)
+                ctx, link.download, name, drive, user=user, binary=binary)
 
         @self.mcp.tool(annotations=ToolAnnotations(
             title="Read a text file", read_only_hint=True))
@@ -479,21 +498,6 @@ class McpServer:
             """
             logger.info("MCP Tool called: rc2014_read_text_file(cpm_path=%r)", cpm_path)
             return link.read_text_file(cpm_path, max_bytes=max_bytes)
-
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Write a text file", read_only_hint=False, destructive_hint=True))
-        async def rc2014_write_text_file(ctx: Context, cpm_path: str, content: str) -> dict:
-            """Write a text file to the board, overwriting it if it exists.
-
-            Newlines are converted to CP/M CRLF and a 0x1A EOF marker is appended.
-            Delivered over XMODEM, so it is safe for source files and .SUB scripts.
-
-            cpm_path: destination including drive, e.g. 'B:HELLO.TXT'. The name must
-            fit CP/M 8.3.
-            """
-            logger.info("MCP Tool called: rc2014_write_text_file(cpm_path=%r, %d chars)",
-                        cpm_path, len(content))
-            return await self._with_progress(ctx, link.write_text_file, cpm_path, content)
 
         @self.mcp.tool(annotations=ToolAnnotations(
             title="Catalogue the drives", read_only_hint=True))
@@ -512,30 +516,6 @@ class McpServer:
             """
             logger.info("MCP Tool called: rc2014_scan_drives()")
             return await self._with_progress(ctx, link.scan_drives)
-
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Calibrate serial pacing", read_only_hint=False, destructive_hint=True))
-        async def rc2014_calibrate_pacing(ctx: Context, dest_drive: str = "",
-                                          test_bytes: int = 16384) -> dict:
-            """Measure the fastest XMODEM write pacing this board accepts.
-
-            The safe defaults were derived on a 7.4MHz Z80 behind an external UART
-            and run the line at roughly 5% of its rate. Faster boards tolerate far
-            more; this finds out empirically, accepting a setting only when a file
-            survives a round trip byte-for-byte, and records it for future runs.
-
-            Takes a few minutes and writes a temporary file to a scratch drive
-            (the volatile RAM disk by default). Worth running once per machine, and
-            before any long transfer such as a ROM image. Keep test_bytes >= 16384:
-            each transfer carries ~15s of fixed cost, so a smaller sample measures
-            that overhead rather than the pacing.
-            Requires the machine to be at a CP/M prompt.
-            """
-            logger.info("MCP Tool called: rc2014_calibrate_pacing(dest_drive=%r, test_bytes=%d)",
-                        dest_drive, test_bytes)
-            return await self._with_progress(ctx, link.calibrate_pacing,
-                                             dest_drive=dest_drive or None,
-                                             test_bytes=test_bytes)
 
         @self.mcp.tool(annotations=ToolAnnotations(
             title="Run SURVEY", read_only_hint=True))
@@ -574,51 +554,6 @@ class McpServer:
             logger.info("MCP Tool called: rc2014_reboot()")
             return link.reboot()
 
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Enable or disable Pixel-Stream mode", read_only_hint=False))
-        def rc2014_enable_pixel_stream(enabled: bool = True) -> dict:
-            """Enable or disable the Mandel Pixel-Stream binary decoder mode.
-
-            When enabled, incoming binary pixel data is intercepted and decoded
-            into pixel frames for GUI/Pygame visualization.
-            """
-            logger.info("MCP Tool called: rc2014_enable_pixel_stream(enabled=%s)", enabled)
-            link.enable_pixel_stream(enabled)
-            return {"ok": True, "mode": getattr(link, "_mode", "terminal")}
-
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Get Mandel pixel frame data", read_only_hint=True, idempotent_hint=True))
-        def rc2014_get_pixel_frame() -> dict:
-            """Get snapshot of current decoded Mandel pixel frame and state."""
-            logger.info("MCP Tool called: rc2014_get_pixel_frame()")
-            return link.get_pixel_frame()
-
-        # Low-level transfer escape hatches: these assume you have already armed
-        # XM on the board yourself. Prefer rc2014_upload / rc2014_download.
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Raw XMODEM send", read_only_hint=False, destructive_hint=True))
-        async def rc2014_xmodem_send(ctx: Context, path: str) -> dict:
-            """Raw XMODEM send - only for a receiver you armed yourself.
-
-            PREREQUISITE: the board must already be waiting to receive (you ran
-            'XM R <FILENAME>' via rc2014_send_text and confirmed it). Use
-            rc2014_upload instead unless you specifically need this.
-            """
-            logger.info("MCP Tool called: rc2014_xmodem_send(path=%r)", path)
-            return await self._with_progress(ctx, link.xmodem_send, path)
-
-        @self.mcp.tool(annotations=ToolAnnotations(
-            title="Raw XMODEM receive", read_only_hint=False, destructive_hint=True))
-        async def rc2014_xmodem_receive(ctx: Context, path: str) -> dict:
-            """Raw XMODEM receive - only for a sender you armed yourself.
-
-            PREREQUISITE: the board must already be waiting to send (you ran
-            'XM S <FILENAME>' via rc2014_send_text and confirmed it). Use
-            rc2014_download instead unless you specifically need this.
-            """
-            logger.info("MCP Tool called: rc2014_xmodem_receive(path=%r)", path)
-            return await self._with_progress(ctx, link.xmodem_receive, path)
-
     # ------------------------------------------------------------------
     # transports
     # ------------------------------------------------------------------
@@ -631,17 +566,13 @@ class McpServer:
             allowed_origins=["*"],
         )
 
-        if self.transport == "sse":
-            app = self.mcp.sse_app(host=self.host, transport_security=security)
-        else:
-            # The streamable HTTP app carries the session-manager lifespan that
-            # /mcp requires, so it has to be the base app. The SSE routes are
-            # self-contained and need no lifespan of their own, so they can be
-            # appended onto it to serve both transports from one server.
-            app = self.mcp.streamable_http_app(host=self.host, transport_security=security)
-            if self.transport == "both":
-                sse_app = self.mcp.sse_app(host=self.host, transport_security=security)
-                app.router.routes.extend(sse_app.router.routes)
+        # stateless_http=True: every request gets its own fresh transport and
+        # connection, for every protocol version - no Mcp-Session-Id is ever
+        # minted or expected. 2026-07-28+ clients already route to the
+        # single-exchange handler unconditionally on protocol version; this
+        # flag is what removes the legacy stateful path for everything else.
+        app = self.mcp.streamable_http_app(
+            host=self.host, stateless_http=True, transport_security=security)
 
         app.add_middleware(
             CORSMiddleware,
@@ -649,26 +580,16 @@ class McpServer:
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
-            # Custom response headers are invisible to browser JS unless listed
-            # here - the Fetch spec only exposes a small safelist by default.
-            # Streamable HTTP clients read the session id off this header on
-            # the initialize response and must echo it back on every request
-            # after; without this, a browser-based client gets a session id
-            # from curl/Node but never sees one, and its next POST comes back
-            # 400 "Missing session ID".
-            expose_headers=["mcp-session-id"],
         )
         return app
 
     def endpoints(self) -> list[str]:
-        paths = {"http": ["/mcp"], "sse": ["/sse"], "both": ["/mcp", "/sse"]}[self.transport]
-        return [f"http://{self.host}:{self.port}{p}" for p in paths]
+        return [f"http://{self.host}:{self.port}/mcp"]
 
     def start(self):
         def _run_server():
             try:
-                logger.info("Starting MCP server on %s:%d (transport=%s)",
-                            self.host, self.port, self.transport)
+                logger.info("Starting MCP server on %s:%d", self.host, self.port)
                 config = uvicorn.Config(self._build_app(), host=self.host,
                                         port=self.port, log_level="info")
                 self._uvicorn = uvicorn.Server(config)

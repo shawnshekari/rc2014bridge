@@ -1,6 +1,13 @@
 import unittest
 from unittest.mock import MagicMock, patch
+
+from starlette.testclient import TestClient
+
 from rc2014bridge.mcp_server import McpServer
+
+_ACCEPT = "application/json, text/event-stream"
+_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
+_CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
 
 
 class TestMcpServer(unittest.TestCase):
@@ -50,6 +57,69 @@ class TestMcpServer(unittest.TestCase):
 
         sl.send_text("DIR")
         sl._write_paced.assert_called_with(b"DIR\r", 8, 0.002)
+
+
+class TestStatelessHttp(unittest.TestCase):
+    """Real HTTP-level coverage of the 2026-07-28 stateless transport.
+
+    Guards against `stateless_http=True` silently regressing on a future
+    `mcp` SDK bump - the whole point of removing the legacy stateful path
+    was that no request, of any protocol version, ever gets an
+    Mcp-Session-Id back.
+    """
+
+    def _client(self) -> TestClient:
+        link = MagicMock()
+        link.hardware_info = {"version": "v3.7.0-dev.13", "cpu": "Z80 @ 7.372MHz"}
+        server = McpServer(link, host="0.0.0.0", port=8014)
+        return TestClient(server._build_app())
+
+    def test_modern_client_gets_a_stateless_json_reply(self):
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "rc2014_get_hardware_info",
+                "arguments": {},
+                "_meta": {
+                    _PROTOCOL_VERSION_META_KEY: "2026-07-28",
+                    _CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            },
+        }
+        with self._client() as client:
+            resp = client.post(
+                "/mcp",
+                json=body,
+                headers={
+                    "Accept": _ACCEPT,
+                    "MCP-Protocol-Version": "2026-07-28",
+                    "Mcp-Method": "tools/call",
+                    "Mcp-Name": "rc2014_get_hardware_info",
+                },
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.headers.get("mcp-session-id"))
+        payload = resp.json()
+        self.assertEqual(payload["id"], 1)
+        self.assertIn("result", payload)
+
+    def test_legacy_protocol_client_gets_no_session_id_either(self):
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-test-client", "version": "0.0.1"},
+            },
+        }
+        with self._client() as client:
+            resp = client.post("/mcp", json=body, headers={"Accept": _ACCEPT})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.headers.get("mcp-session-id"))
 
 
 if __name__ == "__main__":

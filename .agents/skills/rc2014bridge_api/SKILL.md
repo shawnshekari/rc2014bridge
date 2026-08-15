@@ -14,8 +14,7 @@ daemon.
 `rc2014bridge` exposes a single control surface: an **MCP server** on port
 8014 of the host running the bridge.
 
-- Streamable HTTP (preferred): `http://<host-ip>:8014/mcp`
-- SSE (legacy clients): `http://<host-ip>:8014/sse`
+- Stateless streamable HTTP (2026-07-28 spec): `http://<host-ip>:8014/mcp`
 
 A human may be watching the same console in a pygame window, so everything
 you type is visible to them.
@@ -158,32 +157,64 @@ instead of going through `C`/`Z` first.
 
 ## File transfer
 
-`rc2014_upload` and `rc2014_download` handle the whole sequence — running
-`XM` on the board, transferring, and verifying. **Do not run `XM` yourself
-first**; that is what the raw `rc2014_xmodem_send`/`rc2014_xmodem_receive`
-escape hatches are for, and getting the drive prefixes right by hand is
-error-prone.
+`rc2014_upload` and `rc2014_download` are content in, content out — no host
+file path involved. **Do not run `XM` yourself first**; both tools handle the
+whole sequence internally, and getting the drive/user prefixes right by hand
+is error-prone.
+
+**`name` is a bare 8.3 filename, never `"B:HELLO.TXT"`.** This breaks from
+every other tool here (`rc2014_read_text_file`, `rc2014_run_command`, ...),
+which all take one combined `cpm_path`/command string with the drive baked
+in. These two split it: drive and user area are separate parameters.
 
 ```
-rc2014_upload(local_path="/home/me/LEDSHOW.COM", dest_drive="B:")
--> {"ok": true, "cpm_name": "LEDSHOW.COM", "target": "B:LEDSHOW.COM",
-    "bytes": 187, "blocks": 2, "sha256": "...", "verified": true}
+rc2014_upload(name="HELLO.TXT", drive="B", content="line one\nline two\n")
+-> {"ok": true, "target": "B:HELLO.TXT", "existed_before": false,
+    "bytes_raw": 20, "bytes_wire": 132, "compressed": true,
+    "verified": true, "sha256": "..."}
 
-rc2014_download(cpm_path="B:LEDSHOW.COM", local_path="/tmp/out.com")
--> {"ok": true, "bytes": 187, "sha256": "...", "local_path": "/tmp/out.com"}
+rc2014_download(name="HELLO.TXT", drive="B")
+-> {"ok": true, "target": "B:HELLO.TXT", "content": "line one\nline two\n",
+    "binary": false, "bytes_raw": 20, "sha256": "..."}
 ```
 
-Both require an OS to be running (`state=cpm`). `cpm_name` is derived from the
-host filename in CP/M 8.3 form unless you pass one.
+Both require an OS to be running (`state=cpm`). `upload` always zips the
+content and `UNZIP`s it on the board — a whole-file CRC check on the way in,
+essentially free at these sizes. `download` always uses XMODEM's 1K-block
+mode (`XM SK`), since that only exists on the board's send verb and download
+is the direction where the board sends.
 
-`XM` will not write over an existing file, so `rc2014_upload` erases the target
-first and reports `replaced_existing`. Pass `overwrite=false` to fail instead.
-Uploads to the ROM disk (`MD1`, usually `C:`) always fail — it is read-only.
+`binary=false` (the default, both directions) applies CP/M's CRLF +
+trailing-`0x1A`-EOF-marker convention for text, matching what `TYPE` and
+other tools expect — and encodes as **latin-1**: an em-dash, curly quotes, or
+anything else outside that charset is silently replaced with `?` on upload,
+with no error. Confirmed the hard way, sending this very file's README
+through it. Use `binary=true` (base64) for any content that has to survive
+exactly.
 
-For text, `rc2014_read_text_file` / `rc2014_write_text_file` avoid a transfer
-round trip. `read_text_file` uses `TYPE`, so it is **not byte-exact** — tabs
-are expanded and reading stops at the 0x1A EOF marker. Use `rc2014_download`
-when the exact bytes matter.
+`binary=true` passes raw bytes through untouched (`content` is base64 on the
+way in and out) — but is only byte-exact to the file's 128-byte CP/M record
+size, confirmed against real hardware. CP/M has no sub-record length anywhere
+in the filesystem (`STAT` only ever reports whole records), so a binary file
+whose true length isn't a multiple of 128 can come back with trailing
+padding. That's what the CRLF/EOF convention exists to solve for text;
+there's no equivalent for arbitrary binary data.
+
+The download result's `block_size` only reflects the *last* block received,
+not the whole transfer — RomWBW's sender drops to 128-byte blocks for a short
+tail even when the bulk of the file went over in 1K blocks. Don't read it as
+"1K blocks didn't happen" just because it says 128.
+
+`UNZIP` won't replace an existing file any more than `XM` will, so
+`rc2014_upload` erases the target first when `overwrite=true` and reports
+`replaced_existing`; the default is `overwrite=false` (fails instead of
+replacing). Uploads to the ROM disk (`MD1`, usually `C:`) always fail — it is
+read-only. `user` (0-15) addresses a CP/M user area directly, e.g.
+`drive="A", user=1` reaches `A1:` without a separate `USER` command.
+
+For a quick text peek without a transfer, `rc2014_read_text_file` uses `TYPE`
+— cheaper, but **not byte-exact**: tabs are expanded and reading stops at the
+0x1A EOF marker. Use `rc2014_download` when the exact bytes matter.
 
 ## System information
 

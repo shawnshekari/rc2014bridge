@@ -5,3 +5,5 @@ mcp
 uvicorn
 starlette
 sse-starlette
+pytest
+pytest-xdist

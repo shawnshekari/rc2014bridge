@@ -46,9 +46,9 @@ hardware).
   [Connection settings](#connection-settings).
 - **Config file** (`rc2014bridge.ini`), so the long list of CLI flags only
   has to be set once — see [Config file](#config-file).
-- **Serial pacing calibration** (`rc2014_calibrate_pacing`): finds the
-  fastest XMODEM/keystroke pacing a given board actually accepts, proven
-  with a byte-exact round trip — see [Serial pacing](#serial-pacing).
+- **RTS/CTS hardware flow control**: the UART handles write backpressure
+  itself, so manual pacing tuning is no longer the primary path — see
+  [Serial pacing](#serial-pacing).
 
 ## Screenshots
 
@@ -240,7 +240,6 @@ hw-info = hardware_info.json
 enabled = true
 host = 0.0.0.0
 port = 8014
-transport = both
 
 [pacing]
 xmodem-pacing =
@@ -258,9 +257,11 @@ a restart; everything else here is only ever read, not written by the app.
 
 ## The MCP server
 
-The bridge serves MCP over **streamable HTTP at `/mcp`** (the current spec
-transport) and the older **SSE at `/sse`**, both from `0.0.0.0:8014` by
-default. Any MCP client on your network can connect.
+The bridge serves MCP over **stateless streamable HTTP at `/mcp`** (protocol
+2026-07-28 and later), from `0.0.0.0:8014` by default. Every request is
+self-contained - no `initialize` handshake, no session id, no persistent
+connection - so there's no separate SSE transport to connect to either. Any
+MCP client on your network can connect.
 
 ```json
 {
@@ -275,8 +276,7 @@ default. Any MCP client on your network can connect.
 
 Claude Code: `claude mcp add --transport http rc2014bridge http://192.168.1.50:8014/mcp`
 
-Flags: `--mcp-host`, `--mcp-port`, `--mcp-transport {http,sse,both}`,
-`--no-mcp`.
+Flags: `--mcp-host`, `--mcp-port`, `--no-mcp`.
 
 ## Serial pacing
 
@@ -285,11 +285,15 @@ Writes are paced so a slow UART can keep up. The defaults (`8:10` for XMODEM,
 an external SIO and are safe everywhere, but they run a 115200 line at a small
 fraction of its rate.
 
-`rc2014_calibrate_pacing` finds what a board actually accepts, accepting a
-setting only when a file survives a round trip byte-for-byte, and records it in
-`hardware_info` for later runs. Measured on an SC700 (Z180 @ 18.432MHz): `32:5`
-passed, `64:5` failed, and a 64KB upload went from 111s to 59s. Override by hand
-with `--xmodem-pacing 32:5` / `--text-pacing 8:5`.
+**RTS/CTS is now the recommended fix** (`--rtscts`, or set it from the
+Connection Settings screen) — the UART itself throttles writes, so manual
+pacing tuning is no longer the primary path on boards that wire it up.
+`link.calibrate_pacing()` (finds what a board accepts without RTS/CTS,
+accepting a setting only when a file survives a round trip byte-for-byte, and
+records it in `hardware_info` for later runs) still exists for that case, but
+isn't exposed as an MCP tool. Measured on an SC700 (Z180 @ 18.432MHz) before
+RTS/CTS was wired up: `32:5` passed, `64:5` failed, and a 64KB upload went from
+111s to 59s. Override by hand with `--xmodem-pacing 32:5` / `--text-pacing 8:5`.
 
 Note where the time actually goes: pacing is only part of it. Most of the cost is
 per-block turnaround — the board writing a block and ACKing it — so the biggest
@@ -309,16 +313,13 @@ send-then-poll loop.
 | `rc2014_send_keys` | Control characters, nothing appended — `^C`, `^X<PAUSE>^X`, `<ESC>`. The only tool allowed to run mid-operation, because interrupting one is the point. |
 | `rc2014_wait_for` | Wait for a regex in output arriving *from now on*. |
 | `rc2014_wait_until_ready` | Wait for a boot to finish and the prompt to settle. Call after booting a disk — a boot profile keeps running programs, and commands sent during that window are lost. |
-| `rc2014_upload` | Host file → board. Runs XM, transfers, verifies with `DIR`. |
-| `rc2014_download` | Board file → host, with sha256. |
+| `rc2014_upload` | Content → board, zipped over XMODEM, UNZIPed, verified with `DIR`. `binary=false` (default) applies CP/M's CRLF + EOF-marker convention for text. |
+| `rc2014_download` | Board file → content inline, sha256, over XMODEM in 1K blocks. `binary=false` returns text, `binary=true` base64. |
 | `rc2014_read_text_file` | Read text via `TYPE` — no transfer needed. |
-| `rc2014_write_text_file` | Write text, delivered over XMODEM. |
 | `rc2014_scan_drives` | Catalogue every mapped drive with filenames (slow; reports progress). Current user area only. |
 | `rc2014_survey` | Run RomWBW's `SURVEY`: per-drive totals across **all** user areas, memory map, BIOS/BDOS addresses, TPA, active I/O ports. One ~7s command. |
-| `rc2014_calibrate_pacing` | Measure the fastest XMODEM write pacing this board accepts, proving each setting with a byte-exact round trip. Worth running once per machine. |
 | `rc2014_get_hardware_info` | Captured RomWBW/CPU/memory/drive configuration. |
 | `rc2014_reboot` | Reboot, picking the right method for the current state. |
-| `rc2014_xmodem_send` / `rc2014_xmodem_receive` | Raw transfer escape hatches for an XM you armed yourself. |
 
 Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`), so
 clients can auto-approve the safe ones and prompt for reboots and writes.
@@ -340,12 +341,12 @@ to a shell prompt — MBASIC, `ED`, the `Boot [H=Help]:` menu. Use
 ### Security
 
 **The MCP port has no authentication.** Anything that can reach
-`0.0.0.0:8014` can run commands on the board, reboot it, read any host file
-readable by the bridge user (`rc2014_upload` takes an arbitrary host path)
-and write host files anywhere that user can write (`rc2014_download`).
-That's a deliberate trade for a tool on a trusted private network. If the
-machine running the bridge is on a network you don't control, pass
-`--mcp-host 127.0.0.1` and reach it through an SSH tunnel.
+`0.0.0.0:8014` can run commands on the board, reboot it, and read or write
+any file on any mapped drive (`rc2014_upload`/`rc2014_download` take content
+directly, not a host path, but that's still full read/write access to the
+board's storage). That's a deliberate trade for a tool on a trusted private
+network. If the machine running the bridge is on a network you don't
+control, pass `--mcp-host 127.0.0.1` and reach it through an SSH tunnel.
 
 ## Real hardware bugs found building this
 
@@ -454,7 +455,7 @@ All reproduced and confirmed against a physical RC2014, not guessed:
 rc2014bridge/
   link.py        serial port owner: pyte screen state, receive log, run_command,
                  XMODEM send/receive, upload/download composites
-  mcp_server.py  MCP tools, resources, prompts; HTTP + SSE transports
+  mcp_server.py  MCP tools, resources, prompts; stateless HTTP transport
   display.py     pygame rendering + keyboard forwarding
   config.py      INI config file loading + surgical value updates
   app.py         entry point wiring the above together
@@ -465,5 +466,8 @@ tests/
 Run the tests with:
 
 ```
-PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -t tests
+.venv/bin/python -m pytest tests/
 ```
+
+`pytest.ini` runs them in parallel (`pytest-xdist`, `-n auto`) by default — the
+full suite takes ~25s instead of ~170s serial.
