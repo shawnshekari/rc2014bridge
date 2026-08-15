@@ -165,14 +165,74 @@ class TestConnectionHelpers(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("no such device", res["error"])
 
+
+class TestStartsDisconnected(unittest.TestCase):
+    """A configured --port that no longer exists (e.g. a re-plugged FTDI
+    adapter renumbering ttyUSB0 -> ttyUSB1) must not be fatal at startup -
+    SerialLink should come up disconnected so the GUI's Connection Settings
+    screen is reachable to pick the right port."""
+
+    def test_construction_survives_a_missing_port(self):
+        with patch("serial.Serial", side_effect=FileNotFoundError(
+                "[Errno 2] No such file or directory: '/dev/ttyUSB0'")):
+            link = SerialLink("/dev/ttyUSB0", baud=230400, hw_info_file=_hw_path())
+        self.addCleanup(link.close)
+
+        self.assertFalse(link.is_connected)
+        self.assertEqual(link.port, "/dev/ttyUSB0")
+        self.assertEqual(link.baud, 230400)
+        # get_screen()'s state feeds the GUI status bar's connected/disconnected badge.
+        self.assertFalse(link.get_screen()["connected"])
+
+    def test_reader_thread_stays_alive_while_disconnected(self):
+        with patch("serial.Serial", side_effect=OSError("no such device")):
+            link = SerialLink("/dev/ttyUSB0", hw_info_file=_hw_path())
+        self.addCleanup(link.close)
+
+        time.sleep(0.05)
+        self.assertTrue(link._reader.is_alive())
+
+    def test_disconnected_writes_are_a_safe_no_op(self):
+        with patch("serial.Serial", side_effect=OSError("no such device")):
+            link = SerialLink("/dev/ttyUSB0", hw_info_file=_hw_path())
+        self.addCleanup(link.close)
+
+        link.send_text("DIR")  # must not raise
+
+    def test_reconfigure_recovers_a_working_port(self):
+        with patch("serial.Serial", side_effect=OSError("no such device")):
+            link = SerialLink("/dev/ttyUSB0", hw_info_file=_hw_path())
+        self.addCleanup(link.close)
+
+        with _constructing_serial():
+            res = link.reconfigure(port="/dev/ttyUSB1")
+
+        self.assertTrue(res["ok"])
+        self.assertTrue(link.is_connected)
+        self.assertEqual(link.port, "/dev/ttyUSB1")
+
+
+class TestListSerialPorts(unittest.TestCase):
     def test_list_serial_ports_returns_sorted_device_paths(self):
         class FakePortInfo:
-            def __init__(self, device):
+            def __init__(self, device, vid=0x0403):
                 self.device = device
+                self.vid = vid
 
         with patch("serial.tools.list_ports.comports",
                    return_value=[FakePortInfo("/dev/ttyUSB1"), FakePortInfo("/dev/ttyUSB0")]):
             self.assertEqual(list_serial_ports(), ["/dev/ttyUSB0", "/dev/ttyUSB1"])
+
+    def test_list_serial_ports_excludes_non_usb_ports(self):
+        class FakePortInfo:
+            def __init__(self, device, vid):
+                self.device = device
+                self.vid = vid
+
+        with patch("serial.tools.list_ports.comports",
+                   return_value=[FakePortInfo("/dev/ttyUSB0", 0x0403),
+                                 FakePortInfo("/dev/ttyS0", None)]):
+            self.assertEqual(list_serial_ports(), ["/dev/ttyUSB0"])
 
     def test_list_serial_ports_swallows_errors(self):
         with patch("serial.tools.list_ports.comports", side_effect=Exception("boom")):

@@ -602,6 +602,16 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         elif action == "QUIT":
             running = False
 
+    if not getattr(link, "is_connected", True):
+        # e.g. a re-plugged FTDI adapter renumbered ttyUSB0 -> ttyUSB1 since
+        # the last launch/config edit - link.py already came up disconnected
+        # instead of crashing (see SerialLink.__init__), so surface the
+        # Settings screen immediately instead of leaving the user staring at
+        # a terminal that silently never echoes anything.
+        _show_toast(f"Could not open {link.port} - choose a different port below", 6.0)
+        _trigger_action("SHOW_SETTINGS")
+        settings_status = (f"Not connected: {link.port} not found", False)
+
     while running:
         mouse_pos = pygame.mouse.get_pos()
 
@@ -1171,8 +1181,13 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         # to its right, rather than bare text floating on the bar.
         port_name = state.get("port", "/dev/ttyUSB0")
         baud_rate = state.get("baud", 115200)
-        conn_text = f"{port_name} @ {baud_rate} 8N1"
-        conn_img = status_font.render(f" {conn_text} ", True, (190, 205, 220), (38, 46, 56))
+        if state.get("connected", True):
+            conn_text = f"{port_name} @ {baud_rate} 8N1"
+            conn_fg, conn_bg = (190, 205, 220), (38, 46, 56)
+        else:
+            conn_text = f"{port_name} DISCONNECTED (F8 to reconnect)"
+            conn_fg, conn_bg = (255, 220, 220), (120, 30, 30)
+        conn_img = status_font.render(f" {conn_text} ", True, conn_fg, conn_bg)
         _blit_middle(conn_img, 10)
 
         # Mode & System Environment Badge
