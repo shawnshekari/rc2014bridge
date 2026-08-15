@@ -26,9 +26,11 @@ always be able to type, including Ctrl-X to cancel a stuck transfer.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import functools
 import hashlib
+import io
 import json
 import logging
 import os
@@ -37,6 +39,7 @@ import re
 import tempfile
 import threading
 import time
+import zipfile
 
 import pyte
 import serial
@@ -209,13 +212,57 @@ def _checksum(data: bytes) -> int:
     return sum(data) & 0xFF
 
 
-def _to_cpm_filename(path: str) -> str:
-    base = os.path.basename(path)
-    name, ext = os.path.splitext(base)
-    ext = ext.lstrip(".")
-    cpm_name = re.sub(r"[^A-Za-z0-9]", "", name)[:8].upper()
-    cpm_ext = re.sub(r"[^A-Za-z0-9]", "", ext)[:3].upper()
-    return f"{cpm_name}.{cpm_ext}" if cpm_ext else cpm_name
+_CPM_NAME_RE = re.compile(r"^[A-Z0-9$_]{1,8}(\.[A-Z0-9$_]{1,3})?$")
+
+
+def _validate_cpm_name(name: str) -> str | None:
+    """Check an 8.3 CP/M filename, uppercased. Returns an error string, or
+    None if valid - a caller error should be reported, not silently mangled."""
+    if not _CPM_NAME_RE.match(name.upper()):
+        return (f"{name!r} is not a valid 8.3 CP/M filename (up to 8 chars, "
+                f"optional 1-3 char extension, letters/digits/$/_ only)")
+    return None
+
+
+def _format_target(drive: str, user: int, name: str) -> str:
+    """<drive>:<name> for user 0 (the usual case), <drive><user>:<name>
+    otherwise - confirmed working directly against real hardware without a
+    separate USER switch (DIR A1:*.* against a real user-1 area)."""
+    return f"{drive}{user or ''}:{name}"
+
+
+def _zip_single_entry(name: str, data: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(name, data)
+    return buf.getvalue()
+
+
+_STAT_FREE_SPACE_RE = re.compile(r"Bytes Remaining On \w:\s*(\d+)k", re.IGNORECASE)
+
+
+def _parse_stat_free_space(text: str) -> int | None:
+    """Bytes free on a drive from 'STAT <drive>:' output, or None if the
+    wording doesn't match - callers should skip the precheck rather than
+    block a valid transfer on an unparsed reply.
+
+    Not 'XM A': that command's own space report ignores any drive argument
+    and always reports a hardcoded 'A0:' private area - confirmed live
+    against real hardware (XM A B: and XM A while logged into B: both still
+    reported A0:'s free space). STAT <drive>: is what actually varies by
+    drive."""
+    m = _STAT_FREE_SPACE_RE.search(text)
+    return int(m.group(1)) * 1024 if m else None
+
+
+_STAT_FILE_INFO_RE = re.compile(r"^\s*(\d+)\s+(\d+)k\s+\d+\s+\S+", re.MULTILINE)
+
+
+def _parse_stat_file_info(text: str) -> dict:
+    """Records/bytes from 'STAT <file>' output, e.g.
+    ' Recs  Bytes  Ext Acc\\n   10     4k    1 R/W J:MANDEL.COM'."""
+    m = _STAT_FILE_INFO_RE.search(text)
+    return {"records": int(m.group(1)), "bytes": int(m.group(2)) * 1024} if m else {}
 
 
 def _parse_keys(keys: str) -> list[tuple[str, object]]:
@@ -816,6 +863,18 @@ class SerialLink:
     @_exclusive("drive scan")
     def scan_drives(self) -> dict:
         logger.info("Starting CP/M drive scan...")
+        # Fail fast, not through _ensure_cpm_prompt's up-to-20s boot-settle
+        # wait: that wait exists for wait_until_ready()'s job of waiting out
+        # an in-progress boot, where "not cpm yet" is the expected starting
+        # state. hbios/flash_util are conclusively known the instant their
+        # banner arrives (_update_system_state, updated synchronously as
+        # bytes come in), so there's nothing to wait for. "unknown" is not
+        # the same as "conclusively not cpm" - e.g. a screen caught mid
+        # boot-profile-output before any prompt-shaped line has arrived yet -
+        # so that case still goes through the full wait (and its nudge
+        # fallback) rather than failing fast on a guess.
+        if self._system_state in ("hbios", "flash_util"):
+            return {"ok": False, "error": "System is not at CP/M prompt (A> .. P>)"}
         if not self._ensure_cpm_prompt():
             return {"ok": False, "error": "System is not at CP/M prompt (A> .. P>)"}
 
@@ -1025,6 +1084,11 @@ class SerialLink:
         across *all* user areas (DIR only shows the current one), the memory map
         with BIOS/BDOS addresses, and the active I/O ports.
         """
+        # See scan_drives()'s comment: fail fast on a conclusively-not-cpm
+        # state rather than paying _ensure_cpm_prompt's up-to-20s boot-settle
+        # wait. "unknown" still goes through the full wait/nudge path.
+        if self._system_state in ("hbios", "flash_util"):
+            return {"ok": False, "error": "System is not at a CP/M prompt (A> .. P>)"}
         if not self._ensure_cpm_prompt():
             return {"ok": False, "error": "System is not at a CP/M prompt (A> .. P>)"}
 
@@ -1829,6 +1893,7 @@ class SerialLink:
             next_poke = 0.0
             expect_block = 1
             got_first = False
+            last_block_size = BLOCK_SIZE
 
             while time.time() < deadline:
                 if not got_first:
@@ -1855,7 +1920,8 @@ class SerialLink:
                             out.pop()
                     with open(path, "wb") as f:
                         f.write(bytes(out))
-                    return {"ok": True, "bytes": len(out), "blocks": expect_block - 1}
+                    return {"ok": True, "bytes": len(out), "blocks": expect_block - 1,
+                            "block_size": last_block_size}
                 if b0 == CAN:
                     if self._xq_get(timeout=1.0) == CAN:
                         return {"ok": False, "error": "sender cancelled transfer"}
@@ -1865,6 +1931,7 @@ class SerialLink:
 
                 # RomWBW's XM asks for 1K blocks; honour STX if it sends them.
                 size = BLOCK_SIZE if b0 == SOH else LONG_BLOCK_SIZE
+                last_block_size = size
                 got_first = True
                 blk = self._xq_get(timeout=5.0)
                 nblk = self._xq_get(timeout=5.0)
@@ -1946,7 +2013,7 @@ class SerialLink:
         logger.warning("Could not get the console back to a prompt after XM failed")
         return False
 
-    def _arm_xm(self, direction: str, target: str) -> dict:
+    def _arm_xm(self, direction: str, target: str, block_1k: bool = False) -> dict:
         """Run XM on the board and decide whether it's really ready to transfer.
 
         XM's banner is not a commitment. RomWBW's XM prints
@@ -1967,6 +2034,10 @@ class SerialLink:
         backstop.
         """
         verb = "R" if direction == "receive" else "S"
+        if block_1k:
+            if direction == "receive":
+                raise ValueError("no 1K receive mode exists on the R verb (RK is not real XM)")
+            verb += "K"
         start = self.rx_position()
         self.send_text(f"{self._xm_command()} {verb} {target}")
         res = self.wait_for(r"Receiving|Sending|File open|To cancel|Ctrl-X",
@@ -2003,84 +2074,182 @@ class SerialLink:
         stem = target.split(":")[-1].split(".")[0].upper()
         return "NO FILE" not in output and bool(stem) and stem in output
 
-    @_exclusive("upload")
-    def upload(self, local_path: str, dest_drive: str = None, cpm_name: str = None,
-               verify: bool = True, overwrite: bool = True) -> dict:
-        """Copy a host file to the board: arm XM, transfer, confirm it landed.
+    def _encode_upload_content(self, content: str, binary: bool) -> bytes:
+        if binary:
+            return base64.b64decode(content)
+        body = content.replace("\r\n", "\n").replace("\n", "\r\n")
+        data = body.encode("latin-1", errors="replace")
+        if not data.endswith(bytes([SUB])):
+            data += bytes([SUB])  # CP/M text EOF marker
+        return data
 
-        RomWBW's XM refuses to write over an existing file ("++ File exists, use
-        a different name ++"), so replacing one means erasing it first. That is
-        what overwrite=True does; pass False to fail instead.
+    @_exclusive("upload")
+    def upload(self, name: str, drive: str, user: int = 0, content: str = "",
+               binary: bool = False, overwrite: bool = False) -> dict:
+        """Copy content to the board: zip it, arm XM, transfer, UNZIP, confirm.
+
+        Always zips - the container overhead is noise at these file sizes,
+        and extraction buys a whole-file CRC check on the way in that a raw
+        transfer wouldn't get. Text content (binary=False) gets CRLF line
+        endings and a trailing 0x1A CP/M EOF marker before zipping, matching
+        what TYPE and other tools expect.
+
+        RomWBW's UNZIP refuses to overwrite an existing file (reports
+        "EXISTS" and skips it - confirmed against real hardware) just like
+        XM does, so overwrite=True erases the existing target first.
         """
-        if not os.path.isfile(local_path):
-            return {"ok": False, "error": f"local file not found: {local_path}"}
         if self._system_state != "cpm":
             return {"ok": False, "error": f"system is not at a CP/M prompt "
                                           f"(state={self._system_state!r}); boot an OS first"}
+        err = _validate_cpm_name(name)
+        if err:
+            return {"ok": False, "error": err}
+        if not (0 <= user <= 15):
+            return {"ok": False, "error": f"user area must be 0-15, got {user}"}
 
-        with open(local_path, "rb") as f:
-            data = f.read()
-        name = (cpm_name or _to_cpm_filename(local_path)).upper()
-        target = f"{dest_drive.rstrip(':').upper()}:{name}" if dest_drive else name
+        name = name.upper()
+        drive = drive.rstrip(":").upper()
+        target = _format_target(drive, user, name)
+        started = time.time()
 
-        replaced = False
-        if self._file_exists(target):
-            if not overwrite:
-                return {"ok": False, "cpm_name": name, "target": target,
-                        "error": f"{target} already exists and overwrite is disabled"}
-            logger.info("%s exists; erasing it before upload", target)
+        exists = self._file_exists(target)
+        if exists and not overwrite:
+            stat = self.run_command(f"STAT {target}", timeout=DIR_TIMEOUT)
+            return {"ok": False, "target": target, "existed_before": True,
+                    "error": f"{target} already exists and overwrite is disabled",
+                    **_parse_stat_file_info(stat.get("output", ""))}
+
+        raw = self._encode_upload_content(content, binary)
+        zip_bytes = _zip_single_entry(name, raw)
+
+        stat = self.run_command(f"STAT {drive}:", timeout=DIR_TIMEOUT)
+        free = _parse_stat_free_space(stat.get("output", ""))
+        needed = len(zip_bytes) + len(raw)  # zip and its extracted copy briefly coexist
+        if free is not None and free < needed:
+            return {"ok": False, "target": target, "error": "insufficient space",
+                    "available": free, "needed": needed}
+
+        stem = name.split(".")[0]
+        zip_target = f"{drive}:{stem}.ZIP"
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="rc2014-", suffix=".zip", delete=False) as tf:
+                tf.write(zip_bytes)
+                tmp_path = tf.name
+
+            armed = self._arm_xm("receive", zip_target)
+            if not armed["ok"]:
+                return {**armed, "target": target}
+
+            send_res = self.xmodem_send(tmp_path)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        if not send_res.get("ok"):
+            return {**send_res, "target": target}
+
+        if exists:
+            # UNZIP won't replace an existing file (see docstring); erase it
+            # first, same as the old XM-direct path had to.
             self.run_command(f"ERA {target}", timeout=DIR_TIMEOUT)
-            if self._file_exists(target):
-                return {"ok": False, "cpm_name": name, "target": target,
-                        "error": f"could not erase existing {target} (read-only drive?)"}
-            replaced = True
 
-        armed = self._arm_xm("receive", target)
-        if not armed["ok"]:
-            return armed
+        self.run_command(f"UNZIP {zip_target} {_format_target(drive, user, '')}",
+                         timeout=DIR_TIMEOUT)
+        self.run_command(f"ERA {zip_target}", timeout=DIR_TIMEOUT)
 
-        res = self.xmodem_send(local_path)
-        if not res.get("ok"):
-            return {**res, "cpm_name": name, "target": target}
-
-        result = {
-            "ok": True,
-            "cpm_name": name,
+        verified = self._file_exists(target)
+        return {
+            "ok": verified,
             "target": target,
-            "bytes": len(data),
-            "blocks": res.get("blocks"),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "replaced_existing": replaced,
-            "verified": False,
+            "existed_before": exists,
+            "replaced_existing": exists,
+            "bytes_raw": len(raw),
+            "bytes_wire": len(zip_bytes),
+            "compressed": True,
+            "blocks": send_res.get("blocks"),
+            "block_size": BLOCK_SIZE,
+            "duration_s": round(time.time() - started, 2),
+            "verified": verified,
+            "sha256": hashlib.sha256(raw).hexdigest(),
         }
-        if verify:
-            check = self.run_command(f"DIR {target}", timeout=10.0)
-            listing = (check.get("output") or "").upper()
-            result["verified"] = name.split(".")[0] in listing
-            result["verify_output"] = check.get("output")
-        return result
 
     @_exclusive("download")
-    def download(self, cpm_path: str, local_path: str = None) -> dict:
-        """Copy a file off the board: arm XM to send, then receive it."""
+    def download(self, name: str, drive: str, user: int = 0, binary: bool = False) -> dict:
+        """Copy a file off the board: arm XM to send in 1K blocks, receive it.
+
+        1K blocks (XM's SK mode) only exist on the send verb - since the
+        board sends on download, this gets them for free, unlike upload
+        which is stuck at 128-byte blocks regardless. Content comes back
+        inline, not written to a host path.
+
+        binary=True is byte-exact only to the file's CP/M record granularity
+        (128 bytes) - confirmed against real hardware. CP/M/ZSDOS has no
+        sub-record length anywhere in the filesystem (STAT only ever reports
+        whole records), so a binary file whose true length isn't a multiple
+        of 128 comes back padded with whatever trailing bytes that record
+        holds (typically, but not reliably, 0x1A). This is what the CRLF +
+        0x1A EOF-marker convention exists to solve for text (binary=False);
+        there is no equivalent for arbitrary binary content, and nothing this
+        bridge does can recover the precision CP/M itself never stored.
+        """
         if self._system_state != "cpm":
             return {"ok": False, "error": f"system is not at a CP/M prompt "
                                           f"(state={self._system_state!r}); boot an OS first"}
+        err = _validate_cpm_name(name)
+        if err:
+            return {"ok": False, "error": err}
+        if not (0 <= user <= 15):
+            return {"ok": False, "error": f"user area must be 0-15, got {user}"}
 
-        name = cpm_path.split(":")[-1].strip().upper()
-        local_path = os.path.abspath(local_path or name)
+        name = name.upper()
+        drive = drive.rstrip(":").upper()
+        target = _format_target(drive, user, name)
+        started = time.time()
 
-        armed = self._arm_xm("send", cpm_path)
+        if not self._file_exists(target):
+            return {"ok": False, "target": target, "error": "not found"}
+
+        armed = self._arm_xm("send", target, block_1k=True)
         if not armed["ok"]:
-            return armed
+            return {**armed, "target": target}
 
-        res = self.xmodem_receive(local_path)
-        if res.get("ok"):
-            with open(local_path, "rb") as f:
-                res["sha256"] = hashlib.sha256(f.read()).hexdigest()
-            res["local_path"] = local_path
-            res["cpm_path"] = cpm_path
-        return res
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="rc2014-", delete=False) as tf:
+                tmp_path = tf.name
+            # strip_padding removes trailing 0x1A indiscriminately - right for
+            # text (that's our own EOF marker), wrong for binary=True's "raw
+            # bytes in, raw bytes out" promise if real data ends in 0x1A.
+            res = self.xmodem_receive(tmp_path, strip_padding=not binary)
+            if not res.get("ok"):
+                return {**res, "target": target}
+            with open(tmp_path, "rb") as f:
+                raw = f.read()
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        if binary:
+            content = base64.b64encode(raw).decode("ascii")
+        else:
+            text = raw.split(bytes([SUB]), 1)[0].decode("latin-1")
+            content = text.replace("\r\n", "\n")
+
+        return {
+            "ok": True,
+            "target": target,
+            "content": content,
+            "binary": binary,
+            "bytes_raw": len(raw),
+            "bytes_wire": len(raw),
+            "compressed": False,
+            "blocks": res.get("blocks"),
+            "block_size": res.get("block_size"),
+            "duration_s": round(time.time() - started, 2),
+            "verified": True,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
 
     @_exclusive("read file")
     def read_text_file(self, cpm_path: str, max_bytes: int = 8192,
@@ -2124,28 +2293,3 @@ class SerialLink:
             "truncated": truncated,
             "timed_out": res["timed_out"],
         }
-
-    @_exclusive("write file")
-    def write_text_file(self, cpm_path: str, content: str, crlf: bool = True,
-                        verify: bool = True) -> dict:
-        """Write a text file to the board by uploading it over XMODEM."""
-        body = content.replace("\r\n", "\n")
-        if crlf:
-            body = body.replace("\n", "\r\n")
-        data = body.encode("latin-1", errors="replace")
-        if not data.endswith(bytes([SUB])):
-            data += bytes([SUB])  # CP/M text EOF marker
-
-        name = cpm_path.split(":")[-1].strip().upper()
-        drive = f"{cpm_path.split(':')[0]}:" if ":" in cpm_path else None
-
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(prefix="rc2014-", suffix=".txt", delete=False) as tf:
-                tf.write(data)
-                tmp_path = tf.name
-            res = self.upload(tmp_path, dest_drive=drive, cpm_name=name, verify=verify)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        return res

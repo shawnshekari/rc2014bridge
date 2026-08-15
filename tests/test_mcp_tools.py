@@ -40,11 +40,13 @@ class TestToolRegistration(unittest.TestCase):
             {"rc2014_run_command", "rc2014_get_screen", "rc2014_send_text",
              "rc2014_send_keys", "rc2014_wait_for", "rc2014_wait_until_ready",
              "rc2014_upload",
-             "rc2014_download", "rc2014_read_text_file", "rc2014_write_text_file",
+             "rc2014_download", "rc2014_read_text_file",
              "rc2014_scan_drives", "rc2014_survey", "rc2014_get_hardware_info",
-             "rc2014_reboot",
-             "rc2014_xmodem_send", "rc2014_xmodem_receive"},
+             "rc2014_reboot"},
             names)
+        self.assertNotIn("rc2014_write_text_file", names)
+        self.assertNotIn("rc2014_xmodem_send", names)
+        self.assertNotIn("rc2014_xmodem_receive", names)
 
     def test_annotations_mark_safe_and_destructive_tools(self):
         server, _link = _server()
@@ -55,8 +57,7 @@ class TestToolRegistration(unittest.TestCase):
                      "rc2014_survey", "rc2014_wait_until_ready"):
             self.assertTrue(tools[name].read_only_hint, f"{name} should be read-only")
 
-        for name in ("rc2014_reboot", "rc2014_upload", "rc2014_download",
-                     "rc2014_write_text_file"):
+        for name in ("rc2014_reboot", "rc2014_upload", "rc2014_download"):
             self.assertTrue(tools[name].destructive_hint, f"{name} should be destructive")
             self.assertFalse(tools[name].read_only_hint, f"{name} is not read-only")
 
@@ -65,7 +66,8 @@ class TestToolRegistration(unittest.TestCase):
         tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
         params = (tools["rc2014_upload"].input_schema.get("properties") or {}).keys()
         self.assertNotIn("ctx", params)
-        self.assertEqual(set(params), {"local_path", "dest_drive", "cpm_name", "overwrite"})
+        self.assertEqual(set(params),
+                         {"name", "drive", "user", "content", "binary", "overwrite"})
 
 
 class TestToolCalls(unittest.TestCase):
@@ -127,23 +129,32 @@ class TestToolCalls(unittest.TestCase):
         self.assertIn("BOGUS", out)
         self.assertIn("false", out.lower())
 
-    def test_upload_passes_blank_optionals_through_as_none(self):
+    def test_upload_forwards_defaults(self):
         server, link = _server()
-        link.upload.return_value = {"ok": True, "bytes": 187, "verified": True}
+        link.upload.return_value = {"ok": True, "bytes_raw": 12, "verified": True}
 
-        asyncio.run(server.mcp.call_tool("rc2014_upload", {"local_path": "/tmp/x.com"}))
-        link.upload.assert_called_once_with("/tmp/x.com", dest_drive=None, cpm_name=None,
-                                            overwrite=True)
+        asyncio.run(server.mcp.call_tool(
+            "rc2014_upload", {"name": "X.COM", "drive": "B", "content": "hi"}))
+        link.upload.assert_called_once_with("X.COM", "B", user=0, content="hi",
+                                            binary=False, overwrite=False)
 
-    def test_upload_forwards_destination(self):
+    def test_upload_forwards_all_parameters(self):
         server, link = _server()
         link.upload.return_value = {"ok": True}
 
         asyncio.run(server.mcp.call_tool(
-            "rc2014_upload", {"local_path": "/tmp/x.com", "dest_drive": "B:",
-                              "cpm_name": "LEDSHOW.COM", "overwrite": False}))
-        link.upload.assert_called_once_with("/tmp/x.com", dest_drive="B:",
-                                            cpm_name="LEDSHOW.COM", overwrite=False)
+            "rc2014_upload", {"name": "LEDSHOW.COM", "drive": "B", "user": 1,
+                              "content": "aGVsbG8=", "binary": True, "overwrite": True}))
+        link.upload.assert_called_once_with("LEDSHOW.COM", "B", user=1, content="aGVsbG8=",
+                                            binary=True, overwrite=True)
+
+    def test_download_forwards_defaults(self):
+        server, link = _server()
+        link.download.return_value = {"ok": True, "content": "hi"}
+
+        asyncio.run(server.mcp.call_tool(
+            "rc2014_download", {"name": "X.COM", "drive": "B"}))
+        link.download.assert_called_once_with("X.COM", "B", user=0, binary=False)
 
 
 class TestHardwareDoc(unittest.TestCase):

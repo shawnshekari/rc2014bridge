@@ -313,15 +313,13 @@ send-then-poll loop.
 | `rc2014_send_keys` | Control characters, nothing appended — `^C`, `^X<PAUSE>^X`, `<ESC>`. The only tool allowed to run mid-operation, because interrupting one is the point. |
 | `rc2014_wait_for` | Wait for a regex in output arriving *from now on*. |
 | `rc2014_wait_until_ready` | Wait for a boot to finish and the prompt to settle. Call after booting a disk — a boot profile keeps running programs, and commands sent during that window are lost. |
-| `rc2014_upload` | Host file → board. Runs XM, transfers, verifies with `DIR`. |
-| `rc2014_download` | Board file → host, with sha256. |
+| `rc2014_upload` | Content → board, zipped over XMODEM, UNZIPed, verified with `DIR`. `binary=false` (default) applies CP/M's CRLF + EOF-marker convention for text. |
+| `rc2014_download` | Board file → content inline, sha256, over XMODEM in 1K blocks. `binary=false` returns text, `binary=true` base64. |
 | `rc2014_read_text_file` | Read text via `TYPE` — no transfer needed. |
-| `rc2014_write_text_file` | Write text, delivered over XMODEM. |
 | `rc2014_scan_drives` | Catalogue every mapped drive with filenames (slow; reports progress). Current user area only. |
 | `rc2014_survey` | Run RomWBW's `SURVEY`: per-drive totals across **all** user areas, memory map, BIOS/BDOS addresses, TPA, active I/O ports. One ~7s command. |
 | `rc2014_get_hardware_info` | Captured RomWBW/CPU/memory/drive configuration. |
 | `rc2014_reboot` | Reboot, picking the right method for the current state. |
-| `rc2014_xmodem_send` / `rc2014_xmodem_receive` | Raw transfer escape hatches for an XM you armed yourself. |
 
 Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`), so
 clients can auto-approve the safe ones and prompt for reboots and writes.
@@ -343,12 +341,12 @@ to a shell prompt — MBASIC, `ED`, the `Boot [H=Help]:` menu. Use
 ### Security
 
 **The MCP port has no authentication.** Anything that can reach
-`0.0.0.0:8014` can run commands on the board, reboot it, read any host file
-readable by the bridge user (`rc2014_upload` takes an arbitrary host path)
-and write host files anywhere that user can write (`rc2014_download`).
-That's a deliberate trade for a tool on a trusted private network. If the
-machine running the bridge is on a network you don't control, pass
-`--mcp-host 127.0.0.1` and reach it through an SSH tunnel.
+`0.0.0.0:8014` can run commands on the board, reboot it, and read or write
+any file on any mapped drive (`rc2014_upload`/`rc2014_download` take content
+directly, not a host path, but that's still full read/write access to the
+board's storage). That's a deliberate trade for a tool on a trusted private
+network. If the machine running the bridge is on a network you don't
+control, pass `--mcp-host 127.0.0.1` and reach it through an SSH tunnel.
 
 ## Real hardware bugs found building this
 
@@ -468,5 +466,8 @@ tests/
 Run the tests with:
 
 ```
-PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -t tests
+.venv/bin/python -m pytest tests/
 ```
+
+`pytest.ini` runs them in parallel (`pytest-xdist`, `-n auto`) by default — the
+full suite takes ~25s instead of ~170s serial.
