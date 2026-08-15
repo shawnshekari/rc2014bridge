@@ -487,13 +487,14 @@ class SerialLink:
     def __init__(self, port: str, baud: int = 115200, cols: int = 80, rows: int = 48,
                  hw_info_file: str = "hardware_info.json",
                  text_pacing: tuple[int, float] = None,
-                 xmodem_pacing: tuple[int, float] = None):
+                 xmodem_pacing: tuple[int, float] = None,
+                 rtscts: bool = False):
         self.port = port
         self.baud = baud
         self.cols, self.rows = cols, rows
         self.hw_info_file = hw_info_file
         self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
-                                   stopbits=1, timeout=0.1)
+                                   stopbits=1, timeout=0.1, rtscts=rtscts)
         self._write_lock = threading.Lock()
 
         self._screen = pyte.HistoryScreen(cols, rows, history=1000)

@@ -34,6 +34,10 @@ def main():
                         "rc2014_calibrate_pacing last proved on this machine, else 8:10")
     p.add_argument("--text-pacing", metavar="CHUNK:DELAY_MS",
                    help="Override keystroke/command write pacing, e.g. 8:5 (default 1:15)")
+    p.add_argument("--rtscts", action="store_true",
+                   help="Enable hardware RTS/CTS flow control on the serial port. "
+                        "Experimental: only meaningful if both the board and the cable "
+                        "actually wire CTS/RTS through (default: off)")
     p.add_argument("--verbose", "-v", action="store_true", help="Enable DEBUG level logging")
     args = p.parse_args()
 
@@ -57,7 +61,8 @@ def main():
     link = SerialLink(args.port, baud=args.baud, cols=args.cols, rows=args.rows,
                       hw_info_file=args.hw_info,
                       text_pacing=_pacing(args.text_pacing),
-                      xmodem_pacing=_pacing(args.xmodem_pacing))
+                      xmodem_pacing=_pacing(args.xmodem_pacing),
+                      rtscts=args.rtscts)
 
     mcp_server = None
     if args.mcp:

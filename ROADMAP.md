@@ -199,6 +199,33 @@ protocol that beats XMODEM's overhead for routine pushes.
   further-out option if turn-taking ever proves limiting, not a
   prerequisite for Phase II.
 
+**Candidate driving use case: single-step Z80 debugger with a bridge-
+side graphical front end.** Surfaced 2026-08-14 while designing the
+`mandel` repo's pixel-stream protocol (see `~/src/mandel/protocol/
+DESIGN.md` and that repo's PLAN.md for the sibling work this came out
+of) — same architectural shape (target streams compact binary state,
+bridge does the heavy rendering/UI lift) applied to debugging instead of
+graphics: an on-device stub reports register state, memory contents, and
+step/breakpoint events over SIO1, and this app renders a real register
+panel, memory view, and step/continue/breakpoint controls instead of the
+target having to format any of that as human-readable text. Naturally
+non-competing with the pixel-stream work — that stays on the console
+(SIO0), this would live on SIO1 per Phase II's existing design.
+
+Worth checking before designing a debug stub from scratch: does this
+board's ZSDOS build already ship `DDT`/`ZSID` (standard CP/M debuggers -
+single-step, RST-patched software breakpoints, register dump)? If so,
+"efficient protocol" might mean driving those existing primitives
+programmatically instead of reimplementing single-step/breakpoint
+mechanics from zero - the same "structured binary beats screen-scraping
+human-formatted text" lesson that motivated Phase II in the first place.
+Also answers/depends on this file's existing open question about
+`conpoll`/`AUTOCON` and whether the loader's parser is reachable without
+a full reboot.
+
+Not started - logged here as a concrete motivating use case for Phase
+II's still-undesigned wire protocol, not a commitment to build it next.
+
 ### Phase III — dedicated hardware on the RCBus
 
 The only phase that provides genuine bus-level visibility — real

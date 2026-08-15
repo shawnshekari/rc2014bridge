@@ -1,0 +1,144 @@
+# Mandel Pixel-Stream Protocol
+#
+# Canonical copy lives in the `mandel` repo (this file). A mirrored copy
+# lives in `rc2014bridge` at the same relative path (protocol/) - keep the
+# two byte-for-byte identical. If the protocol changes, edit this copy
+# first, bump `version`, then copy the whole file over to rc2014bridge.
+# Do not hand-edit the two copies independently; that's exactly the drift
+# this file's `version` field exists to catch.
+#
+# See protocol/DESIGN.md in this repo for the full rationale, integration
+# points, and open questions - read that first if you're new to this.
+
+protocol: mandel-pixel-stream
+version: 1
+
+# --- Framing / encoding -----------------------------------------------
+#
+# Every byte in the stream is a self-describing token - there is no raw
+# ANSI, no CR/LF framing, no literal text anywhere in this protocol. Top
+# 5 bits select an index (0-30 = a real palette/iteration-count index, 31
+# = reserved control namespace); bottom 3 bits select a run-length code
+# (for pixel tokens) or a control function (for control tokens, i.e.
+# whenever index == 31).
+#
+# Board-agnostic by design: nothing here assumes a specific CPU, clock
+# speed, or transport. A future Z180 build (hardware MLT, 36.8MHz) should
+# be able to speak this exact same protocol without a version bump.
+encoding:
+  byte_layout: "iiiiirrr"        # 5 bits index, 3 bits run/control code
+  pixel_index_range: [0, 30]     # must match the sender's iteration_max (<=30)
+  control_index: 31              # 0b11111 - never a real pixel index
+
+  run_codes:
+    direct:
+      range: [0, 6]
+      run_length_formula: "code + 1"
+      description: >
+        A literal run of (code+1) consecutive pixels at this index, in
+        one byte. Covers run lengths 1-7.
+    extended:
+      code: 7
+      description: >
+        This index repeats for a run given by the very next byte, taken
+        as a full 8-bit count (0-255) - not an offset added to anything.
+        Used whenever a run exceeds 7. Two bytes total for any run length
+        up to 255 (this program's rows never exceed that, but the format
+        doesn't assume a specific row width).
+
+  control_codes:
+    description: "Only meaningful when the token's index field == 31."
+    codes:
+      0: END_OF_ROW
+      1: END_OF_FRAME       # end of the whole render; replaces the old crlfeos+finished text
+      2: VERSION_BANNER     # the single byte immediately following this token is the protocol version number; sent once, before any pixel data, if sent at all
+      # 3-7: reserved, unused in v1
+
+  worked_bytes:
+    END_OF_ROW: 0xF8
+    END_OF_FRAME: 0xF9
+    VERSION_BANNER: 0xFA
+
+# --- Palette (bridge-side only - the sender never reads this section) --
+#
+# RGB values were derived directly from the current hand-tuned xterm-256
+# `hsv` table in mandel_z80.asm (see the xterm256 field on each entry),
+# using the standard 6x6x6 color-cube level table [0,95,135,175,215,255]
+# - this preserves the exact look already confirmed correct on real
+# hardware, it is not an invented palette. index 0 is the interior/
+# never-diverged case with a sudden cutoff (see PLAN.md's "reworked the
+# palette again" entry); indices 1-30 are escape-count bands, brightest
+# near the boundary (index 1) and darkest at the far-field edge (index 30).
+#
+# The sender (mandel_z80.asm / future variants) sends the raw iteration
+# count only - it has no hsv/chartable tables at all under this protocol.
+# All color decisions happen on the receiving/bridge side, using this
+# table (or a hand-edited successor - this is a good place to experiment
+# with true-RGB gradients the old xterm-256 palette couldn't represent).
+palette:
+  - {index: 0,  xterm256: 0,   rgb: [0, 0, 0]}
+  - {index: 1,  xterm256: 231, rgb: [255, 255, 255]}
+  - {index: 2,  xterm256: 231, rgb: [255, 255, 255]}
+  - {index: 3,  xterm256: 195, rgb: [215, 255, 255]}
+  - {index: 4,  xterm256: 195, rgb: [215, 255, 255]}
+  - {index: 5,  xterm256: 159, rgb: [175, 255, 255]}
+  - {index: 6,  xterm256: 159, rgb: [175, 255, 255]}
+  - {index: 7,  xterm256: 159, rgb: [175, 255, 255]}
+  - {index: 8,  xterm256: 123, rgb: [135, 255, 255]}
+  - {index: 9,  xterm256: 123, rgb: [135, 255, 255]}
+  - {index: 10, xterm256: 87,  rgb: [95, 255, 255]}
+  - {index: 11, xterm256: 87,  rgb: [95, 255, 255]}
+  - {index: 12, xterm256: 51,  rgb: [0, 255, 255]}
+  - {index: 13, xterm256: 51,  rgb: [0, 255, 255]}
+  - {index: 14, xterm256: 45,  rgb: [0, 215, 255]}
+  - {index: 15, xterm256: 45,  rgb: [0, 215, 255]}
+  - {index: 16, xterm256: 45,  rgb: [0, 215, 255]}
+  - {index: 17, xterm256: 39,  rgb: [0, 175, 255]}
+  - {index: 18, xterm256: 39,  rgb: [0, 175, 255]}
+  - {index: 19, xterm256: 33,  rgb: [0, 135, 255]}
+  - {index: 20, xterm256: 33,  rgb: [0, 135, 255]}
+  - {index: 21, xterm256: 33,  rgb: [0, 135, 255]}
+  - {index: 22, xterm256: 27,  rgb: [0, 95, 255]}
+  - {index: 23, xterm256: 27,  rgb: [0, 95, 255]}
+  - {index: 24, xterm256: 21,  rgb: [0, 0, 255]}
+  - {index: 25, xterm256: 20,  rgb: [0, 0, 215]}
+  - {index: 26, xterm256: 19,  rgb: [0, 0, 175]}
+  - {index: 27, xterm256: 18,  rgb: [0, 0, 135]}
+  - {index: 28, xterm256: 18,  rgb: [0, 0, 135]}
+  - {index: 29, xterm256: 17,  rgb: [0, 0, 95]}
+  - {index: 30, xterm256: 16,  rgb: [0, 0, 0]}
+
+# --- Golden test vectors ------------------------------------------------
+#
+# Both the Z80 encoder and the bridge's Python decoder must reproduce
+# these exactly. Bytes are space-separated hex. Generate/verify these
+# programmatically if you ever change them by hand - see
+# protocol/generate_test_vectors.py in this repo for the reference
+# encoder these were produced and checked against.
+test_vectors:
+  - name: single_pixel
+    input: [0]
+    encoded: "00 F8"
+
+  - name: short_run
+    input: [5, 5, 5]
+    encoded: "2A F8"
+
+  - name: max_direct_run
+    input: [3, 3, 3, 3, 3, 3, 3]      # 7 repeats - still fits in one byte
+    encoded: "1E F8"
+
+  - name: extended_run
+    input: [7, 7, 7, 7, 7, 7, 7, 7]   # 8 repeats - needs the extension byte
+    encoded: "3F 08 F8"
+
+  - name: mixed_row
+    input: [0, 0, 0, 0, 1, 1, 30]
+    encoded: "03 09 F0 F8"
+
+  - name: two_rows_and_end_of_frame
+    input_rows: [[0, 0, 0], [30]]
+    encoded: "02 F8 F0 F8 F9"
+
+  - name: version_banner_prefix
+    encoded_prefix: "FA 01"           # VERSION_BANNER, then version=1
