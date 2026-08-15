@@ -574,6 +574,25 @@ class McpServer:
             logger.info("MCP Tool called: rc2014_reboot()")
             return link.reboot()
 
+        @self.mcp.tool(annotations=ToolAnnotations(
+            title="Enable or disable Pixel-Stream mode", read_only_hint=False))
+        def rc2014_enable_pixel_stream(enabled: bool = True) -> dict:
+            """Enable or disable the Mandel Pixel-Stream binary decoder mode.
+
+            When enabled, incoming binary pixel data is intercepted and decoded
+            into pixel frames for GUI/Pygame visualization.
+            """
+            logger.info("MCP Tool called: rc2014_enable_pixel_stream(enabled=%s)", enabled)
+            link.enable_pixel_stream(enabled)
+            return {"ok": True, "mode": getattr(link, "_mode", "terminal")}
+
+        @self.mcp.tool(annotations=ToolAnnotations(
+            title="Get Mandel pixel frame data", read_only_hint=True, idempotent_hint=True))
+        def rc2014_get_pixel_frame() -> dict:
+            """Get snapshot of current decoded Mandel pixel frame and state."""
+            logger.info("MCP Tool called: rc2014_get_pixel_frame()")
+            return link.get_pixel_frame()
+
         # Low-level transfer escape hatches: these assume you have already armed
         # XM on the board yourself. Prefer rc2014_upload / rc2014_download.
         @self.mcp.tool(annotations=ToolAnnotations(

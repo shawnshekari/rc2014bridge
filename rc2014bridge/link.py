@@ -38,6 +38,8 @@ import time
 import pyte
 import serial
 
+from rc2014bridge.pixel_stream import PixelStreamDecoder
+
 logger = logging.getLogger("rc2014bridge")
 
 SOH, STX, EOT, ACK, NAK, CAN, SUB = 0x01, 0x02, 0x04, 0x06, 0x15, 0x18, 0x1A
@@ -511,6 +513,7 @@ class SerialLink:
         self._mode = "terminal"
         self._mode_lock = threading.Lock()
         self._xmodem_q: "queue.Queue[int]" = queue.Queue()
+        self._pixel_decoder = PixelStreamDecoder()
 
         self._op_lock = threading.RLock()
         self._current_op = ""
@@ -999,6 +1002,22 @@ class SerialLink:
             elif re.search(r"([A-Za-z0-9_-]+[:>])", line_s):
                 self._last_prompt = line_s
 
+    def enable_pixel_stream(self, enabled: bool = True):
+        """Toggle Mandel Pixel-Stream protocol decoder mode."""
+        with self._mode_lock:
+            if enabled:
+                self._mode = "pixel_stream"
+                self._pixel_decoder.reset()
+                logger.info("Enabled Mandel Pixel-Stream decoder mode")
+            else:
+                if self._mode == "pixel_stream":
+                    self._mode = "terminal"
+                    logger.info("Disabled Pixel-Stream mode; reverted to terminal")
+
+    def get_pixel_frame(self) -> dict:
+        """Get snapshot of current decoded Mandel pixel frame."""
+        return self._pixel_decoder.get_current_frame_snapshot()
+
     # ------------------------------------------------------------------
     # reader thread
     # ------------------------------------------------------------------
@@ -1016,6 +1035,8 @@ class SerialLink:
             if mode == "xmodem":
                 for b in data:
                     self._xmodem_q.put(b)
+            elif mode == "pixel_stream":
+                self._pixel_decoder.feed(data)
             else:
                 text = data.decode("latin-1")
                 self._update_system_state(text)

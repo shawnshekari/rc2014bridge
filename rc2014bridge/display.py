@@ -158,6 +158,7 @@ MENU_DATA = [
         "title": "View",
         "items": [
             {"label": "RC2014 Hardware & Disk Info... (F5)", "action": "SHOW_HW_INFO"},
+            {"label": "Toggle Mandel Pixel-Stream Mode (F7)", "action": "TOGGLE_PIXEL_STREAM"},
             {"label": "Reset Scrollback (Shift+End)", "action": "RESET_SCROLLBACK"},
         ],
     },
@@ -309,6 +310,14 @@ def run(link, title: str = "RC2014 Bridge"):
             show_reboot_modal = True
         elif action == "SHOW_HW_INFO":
             show_hw_info_modal = True
+        elif action == "TOGGLE_PIXEL_STREAM":
+            cur_m = getattr(link, "_mode", "terminal")
+            new_en = (cur_m != "pixel_stream")
+            link.enable_pixel_stream(new_en)
+            if new_en:
+                _show_toast("Mandel Pixel-Stream mode ENABLED (F7 to toggle)")
+            else:
+                _show_toast("Pixel-Stream mode DISABLED (terminal restored)")
         elif action == "RESET_SCROLLBACK":
             scroll_offset = 0
         elif action == "QUIT":
@@ -421,6 +430,9 @@ def run(link, title: str = "RC2014 Bridge"):
                     else:
                         _show_toast("Scan error: System must be in CP/M / ZSDOS mode")
                     continue
+                elif event.key == pygame.K_F7:
+                    _trigger_action("TOGGLE_PIXEL_STREAM")
+                    continue
 
                 if event.mod & pygame.KMOD_SHIFT:
                     if event.key == pygame.K_PAGEUP:
@@ -466,48 +478,80 @@ def run(link, title: str = "RC2014 Bridge"):
             pygame.display.set_caption(caption)
 
         # --------------------------------------------------------------
-        # 1. Render Terminal Viewport
+        # 1. Render Terminal / Pixel Stream Viewport
         # --------------------------------------------------------------
-        runs = state.get("runs")
-        if runs:
-            for row, row_runs in enumerate(runs):
-                col_offset = 0
-                for run_data in row_runs:
-                    text = run_data["text"]
-                    if not text:
-                        continue
-                    fg_val = run_data.get("fg", "default")
-                    bg_val = run_data.get("bg", "default")
-                    bold = run_data.get("bold", False)
-                    reverse = run_data.get("reverse", False)
-                    underscore = run_data.get("underscore", False)
+        if getattr(link, "_mode", "terminal") == "pixel_stream":
+            snap = link.get_pixel_frame()
+            rgb_grid = snap.get("rgb_data", [])
+            view_h = screen_h - TOP_MENU_HEIGHT - STATUS_BAR_HEIGHT
+            if rgb_grid:
+                p_rows = len(rgb_grid)
+                p_cols = max((len(r) for r in rgb_grid), default=0)
+                if p_rows > 0 and p_cols > 0:
+                    scale_x = max(1, screen_w // p_cols)
+                    scale_y = max(1, view_h // p_rows)
+                    scale = min(scale_x, scale_y)
 
-                    fg_rgb = _resolve_color(fg_val, FG, is_bold=bold)
-                    bg_rgb = _resolve_color(bg_val, BG)
+                    px_w = p_cols * scale
+                    px_h = p_rows * scale
+                    start_x = (screen_w - px_w) // 2
+                    start_y = term_y + (view_h - px_h) // 2
 
-                    if reverse:
-                        fg_rgb, bg_rgb = bg_rgb, fg_rgb
+                    pygame.draw.rect(surface, (10, 10, 15), (0, term_y, screen_w, view_h))
+                    for r_idx, row in enumerate(rgb_grid):
+                        for c_idx, rgb in enumerate(row):
+                            rect = pygame.Rect(start_x + c_idx * scale, start_y + r_idx * scale, scale, scale)
+                            pygame.draw.rect(surface, rgb, rect)
 
-                    img = font.render(text, False, fg_rgb, bg_rgb)
-                    x_pos = col_offset * cell_w
-                    y_pos = term_y + row * cell_h
-                    surface.blit(img, (x_pos, y_pos))
-
-                    if underscore:
-                        run_w = len(text) * cell_w
-                        pygame.draw.line(surface, fg_rgb, (x_pos, y_pos + cell_h - 1), (x_pos + run_w, y_pos + cell_h - 1))
-
-                    col_offset += len(text)
+                    tag_ver = snap.get("version") or 1
+                    tag_text = f" PIXEL-STREAM v{tag_ver} | Frame {snap.get('frame_count')} | {p_cols}x{p_rows} "
+                    tag_img = font.render(tag_text, True, (255, 255, 255), (30, 90, 160))
+                    surface.blit(tag_img, (start_x, max(term_y + 4, start_y - tag_img.get_height() - 2)))
+            else:
+                pygame.draw.rect(surface, (10, 10, 15), (0, term_y, screen_w, view_h))
+                msg_img = font.render("Awaiting Mandel Pixel-Stream data...", True, (150, 180, 210))
+                surface.blit(msg_img, ((screen_w - msg_img.get_width()) // 2, term_y + (view_h - msg_img.get_height()) // 2))
         else:
-            for row, line in enumerate(state["lines"]):
-                if line.strip():
-                    img = font.render(line, False, FG, BG)
-                    surface.blit(img, (0, term_y + row * cell_h))
+            runs = state.get("runs")
+            if runs:
+                for row, row_runs in enumerate(runs):
+                    col_offset = 0
+                    for run_data in row_runs:
+                        text = run_data["text"]
+                        if not text:
+                            continue
+                        fg_val = run_data.get("fg", "default")
+                        bg_val = run_data.get("bg", "default")
+                        bold = run_data.get("bold", False)
+                        reverse = run_data.get("reverse", False)
+                        underscore = run_data.get("underscore", False)
 
-        if scroll_offset == 0 and (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
-            cx, cy = state["cursor"]["x"], state["cursor"]["y"]
-            rect = pygame.Rect(cx * cell_w, term_y + cy * cell_h, cell_w, cell_h)
-            pygame.draw.rect(surface, CURSOR, rect, width=2)
+                        fg_rgb = _resolve_color(fg_val, FG, is_bold=bold)
+                        bg_rgb = _resolve_color(bg_val, BG)
+
+                        if reverse:
+                            fg_rgb, bg_rgb = bg_rgb, fg_rgb
+
+                        img = font.render(text, False, fg_rgb, bg_rgb)
+                        x_pos = col_offset * cell_w
+                        y_pos = term_y + row * cell_h
+                        surface.blit(img, (x_pos, y_pos))
+
+                        if underscore:
+                            run_w = len(text) * cell_w
+                            pygame.draw.line(surface, fg_rgb, (x_pos, y_pos + cell_h - 1), (x_pos + run_w, y_pos + cell_h - 1))
+
+                        col_offset += len(text)
+            else:
+                for row, line in enumerate(state["lines"]):
+                    if line.strip():
+                        img = font.render(line, False, FG, BG)
+                        surface.blit(img, (0, term_y + row * cell_h))
+
+            if scroll_offset == 0 and (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
+                cx, cy = state["cursor"]["x"], state["cursor"]["y"]
+                rect = pygame.Rect(cx * cell_w, term_y + cy * cell_h, cell_w, cell_h)
+                pygame.draw.rect(surface, CURSOR, rect, width=2)
 
         if scroll_offset > 0:
             badge_text = f" SCROLLBACK: -{scroll_offset} lines (Shift+End to exit) "
@@ -712,6 +756,10 @@ def run(link, title: str = "RC2014 Bridge"):
             mode_label = "XMODEM"
             badge_bg = (180, 110, 20)
             badge_fg = (255, 240, 200)
+        elif mode in ("PIXEL_STREAM", "PIXEL-STREAM"):
+            mode_label = "PIXEL-STREAM"
+            badge_bg = (30, 110, 180)
+            badge_fg = (210, 240, 255)
         elif sys_env == "CPM":
             mode_label = "CPM/ZSDOS"
             badge_bg = (24, 85, 45)
