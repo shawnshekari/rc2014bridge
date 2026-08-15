@@ -1164,12 +1164,16 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         pygame.draw.rect(surface, (22, 26, 32), bar_rect)
         pygame.draw.line(surface, (55, 65, 80), (0, status_y), (screen_w, status_y), width=1)
 
-        # Left Info: Port & Baud
+        def _blit_middle(img, x):
+            surface.blit(img, (x, status_y + (STATUS_BAR_HEIGHT - img.get_height()) // 2))
+
+        # Left Info: Port & Baud - a filled pill like the mode/RX/TX badges
+        # to its right, rather than bare text floating on the bar.
         port_name = state.get("port", "/dev/ttyUSB0")
         baud_rate = state.get("baud", 115200)
         conn_text = f"{port_name} @ {baud_rate} 8N1"
-        conn_img = status_font.render(conn_text, True, (170, 185, 200))
-        surface.blit(conn_img, (10, status_y + (STATUS_BAR_HEIGHT - conn_img.get_height()) // 2))
+        conn_img = status_font.render(f" {conn_text} ", True, (190, 205, 220), (38, 46, 56))
+        _blit_middle(conn_img, 10)
 
         # Mode & System Environment Badge
         mode = state.get("mode", "terminal").upper()
@@ -1203,9 +1207,6 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             mode_label = "TERMINAL"
             badge_bg = (40, 50, 60)
             badge_fg = (180, 200, 220)
-
-        def _blit_middle(img, x):
-            surface.blit(img, (x, status_y + (STATUS_BAR_HEIGHT - img.get_height()) // 2))
 
         badge_txt_img = status_font.render(f" {mode_label} ", True, badge_fg, badge_bg)
         badge_x = 10 + conn_img.get_width() + 14
