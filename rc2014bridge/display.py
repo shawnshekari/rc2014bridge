@@ -169,6 +169,7 @@ MENU_DATA = [
         "items": [
             {"label": "RC2014 Hardware & Disk Info... (F5)", "action": "SHOW_HW_INFO"},
             {"label": "Toggle Mandel Pixel-Stream Mode (F7)", "action": "TOGGLE_PIXEL_STREAM"},
+            {"label": "Copy Screen to Clipboard (F9)", "action": "COPY_SCREEN"},
             {"label": "Reset Scrollback (Shift+End)", "action": "RESET_SCROLLBACK"},
         ],
     },
@@ -288,6 +289,40 @@ def _open_system_file_dialog(mode: str = "open", title: str = "Select File") -> 
         pass
 
     return None
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Write `text` to the system clipboard. Same shell-out philosophy as
+    _open_system_file_dialog above - pygame.scrap needs SDL's clipboard
+    driver initialized and behaves inconsistently under Wayland, whereas
+    these CLI tools are what most Linux desktops already have for exactly
+    this job.
+
+    xclip/wl-copy fork into the background to keep serving the selection
+    after the invoking process exits, and the backgrounded copy inherits
+    whatever fds it was given - so stdout/stderr must NOT be captured
+    (PIPE) here, or subprocess.run() blocks forever waiting for a pipe
+    close that the (still-running) background process never delivers.
+    The timeout is a backstop for the same failure mode."""
+    for tool, args in (
+        ("wl-copy", []),
+        ("xclip", ["-selection", "clipboard"]),
+        ("xsel", ["--clipboard", "--input"]),
+    ):
+        tool_path = shutil.which(tool)
+        if not tool_path:
+            continue
+        try:
+            res = subprocess.run(
+                [tool_path, *args], input=text, text=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, timeout=5,
+            )
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 # mandel_z80's x_step:y_step samples a non-square grid - each cell is 2x
@@ -586,6 +621,12 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                 _show_toast("Mandel Pixel-Stream mode ENABLED (F7 to toggle)")
             else:
                 _show_toast("Pixel-Stream mode DISABLED (terminal restored)")
+        elif action == "COPY_SCREEN":
+            screen_text = "\n".join(l.rstrip() for l in link.get_screen(scroll_offset=scroll_offset).get("lines", []))
+            if _copy_to_clipboard(screen_text):
+                _show_toast("Copy Success: Screen copied to clipboard")
+            else:
+                _show_toast("Copy failed: no clipboard tool found (install xclip, xsel, or wl-clipboard)", 6.0)
         elif action == "RESET_SCROLLBACK":
             scroll_offset = 0
         elif action == "SHOW_SETTINGS":
@@ -778,6 +819,9 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     continue
                 elif event.key == pygame.K_F8:
                     _trigger_action("SHOW_SETTINGS")
+                    continue
+                elif event.key == pygame.K_F9:
+                    _trigger_action("COPY_SCREEN")
                     continue
 
                 if event.mod & pygame.KMOD_SHIFT:
