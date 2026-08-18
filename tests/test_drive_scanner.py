@@ -398,6 +398,18 @@ class TestZpm3Banner(unittest.TestCase):
             "Boot [H=Help]:")
         self.assertTrue(link.hardware_info.get("devices"))
 
+    def test_loader_handoff_to_rom_app_clears_hbios_state(self):
+        # "B" boots BASIC from the loader; its "Memory top?" question matches
+        # no prompt pattern, so without the handoff the badge would keep
+        # claiming HBIOS for the whole BASIC session.
+        link = self._link()
+        link._update_system_state(
+            "Small Computer SC126 [SCZ180_sc126_std] Boot Loader\r\n"
+            "Boot [H=Help]:")
+        self.assertEqual(link._system_state, "hbios")
+        link._update_system_state("b\r\nLoading BASIC...\r\nMemory top?")
+        self.assertEqual(link._system_state, "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

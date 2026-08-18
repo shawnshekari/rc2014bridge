@@ -1478,6 +1478,13 @@ class SerialLink:
                 self._set_prompt_state(line_s)
             elif FLASH_PROMPT_RE.search(line_s):
                 self._set_prompt_state(line_s)
+            elif (self._system_state == "hbios"
+                    and re.match(r"^(Loading|Booting)\s", line_s)):
+                # The loader just handed off to a selection (CP/M, Z-System,
+                # BASIC, Forth, a game, ...). Until whatever it is prints its
+                # own prompt, "hbios" is a lie - the badge goes blank instead.
+                self._system_state = "unknown"
+                self._last_prompt = line_s
             elif re.search(r"([A-Za-z0-9_-]+[:>])", line_s):
                 self._last_prompt = line_s
 
