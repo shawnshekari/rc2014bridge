@@ -342,6 +342,28 @@ class TestZpm3Banner(unittest.TestCase):
         self.assertEqual(link.hardware_info.get("cpm_version"), "CP/M-80 v2.2")
         self.assertEqual(link.get_screen()["os"], "cpm")
 
+    def test_banner_straddling_two_reads_still_clears(self):
+        # Live serial reads split the banner mid-string; checking the chunk
+        # alone misses it and the stale ZPM3 flag survives (seen on hardware:
+        # badge read ZPM3 through an entire CP/M boot).
+        link = self._link()
+        link._zpm3 = True
+        link._system_state = "cpm"
+        link.hardware_info["zpm3_version"] = "ZPM3 for HBIOS v3.7.0"
+        link._update_system_state("stale output\r\nRomWBW HB")
+        link._update_system_state("IOS v3.7.0-dev.12\r\n")
+        self.assertFalse(link._zpm3)
+        self.assertEqual(link._system_state, "unknown")
+        self.assertNotIn("zpm3_version", link.hardware_info)
+        # More text arriving must not re-fire on the same banner occurrence.
+        link._update_system_state("ROM VERIFY: 00 00 00 00 PASS\r\n")
+        self.assertEqual(link._system_state, "unknown")
+        # ... but the next boot's banner must fire again.
+        link._zpm3 = True
+        link._update_system_state("\r\nRomWBW HBIOS v3.7.1\r\n")
+        self.assertFalse(link._zpm3)
+        self.assertEqual(link._system_state, "unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -779,6 +779,11 @@ class SerialLink:
         logger.info("Write pacing: text=%s xmodem=%s", self.text_pacing, self.xmodem_pacing)
         self._hw_snapshot = json.dumps(self.hardware_info, sort_keys=True)
         self._boot_buffer = ""
+        # Boot-marker detection state: the banner can straddle two reads, so
+        # _update_system_state() searches the accumulated buffer and uses this
+        # absolute position to fire exactly once per banner occurrence.
+        self._rx_bytes_total = 0
+        self._last_marker_fired_at = -1
         # Half-received console line, kept across read chunks so prompt/state
         # detection sees whole lines - the read loop drains in_waiting, so a
         # prompt typically arrives in several small pieces.
@@ -1377,22 +1382,30 @@ class SerialLink:
         self._check_for_baud_mismatch(text)
 
         self._boot_buffer += text
+        self._rx_bytes_total += len(text)
         # A fresh boot banner means a new boot: drop everything before it, or
         # the buffer keeps older banners and the parsers - which take the
         # first match they find - report the previous firmware. That bit for
         # real after a ROM update, where the board had booted v3.7.0 and this
-        # still said v3.5.0. (Must trigger on "in text", not on rfind() > 0:
-        # a banner landing exactly at the buffer start is still a new boot -
-        # a stale _zpm3 flag otherwise survives a reboot from ZPM3 into plain
-        # CP/M.) "RomWBW HBIOS v" is the RomWBW banner; SC126-class boards
-        # print neither that nor any RomWBW line - their loader announces
-        # itself with "... Boot Loader" and every CP/M-flavor boot then prints
-        # a "CBIOS v..." line, so those are new-boot markers too. ZPM3/ZSDOS
-        # boots print their own sign-on AFTER the CBIOS line, so clearing the
-        # flags here can't hide them - they re-set below in the same boot.
-        marker = next((m for m in _NEW_BOOT_MARKERS if m in text), None)
+        # still said v3.5.0. "RomWBW HBIOS v" is the RomWBW banner; the loader
+        # banner ("... Boot Loader") and the "CBIOS v" line every CP/M-flavor
+        # boot prints serve as markers too. ZPM3/ZSDOS boots print their own
+        # sign-on AFTER the CBIOS line, so clearing the flags here can't hide
+        # them - they re-set below in the same boot.
+        # The banner can straddle two reads, so search the accumulated buffer,
+        # not just this chunk, and track the absolute position of the last
+        # occurrence actioned so each banner fires exactly once (buffer cuts
+        # keep positions consistent because the base is recomputed per call).
+        base = self._rx_bytes_total - len(self._boot_buffer)
+        marker = None
+        marker_abs = self._last_marker_fired_at
+        for m in _NEW_BOOT_MARKERS:
+            idx = self._boot_buffer.rfind(m)
+            if idx >= 0 and base + idx > marker_abs:
+                marker, marker_abs = m, base + idx
         if marker:
-            self._boot_buffer = self._boot_buffer[self._boot_buffer.rfind(marker):]
+            self._last_marker_fired_at = marker_abs
+            self._boot_buffer = self._boot_buffer[marker_abs - base:]
             # A fresh boot re-decides the OS flavor - drop the stale flags so
             # booting ZSDOS or CP/M-80 after ZPM3 (or vice versa) isn't
             # misreported. The next banner/prompt sets them again. The state
