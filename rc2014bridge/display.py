@@ -501,8 +501,8 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
     sb_offset = 0       # clamped scroll offset, synced from get_screen()
     scrollbar_drag = False
     drag_grab_dy = 0
-    sel_anchor = None       # (col,row) where the current selection drag began
-    sel_cells = None        # normalized ((c0,r0),(c1,r1)) of the selection
+    sel_anchor = None       # (col,absrow) where the current selection drag began
+    sel_cells = None        # normalized ((c0,absr0),(c1,absr1)) of the selection
     sel_dragging = False
     last_lines = []         # lines currently on display, for copy extraction
 
@@ -511,6 +511,13 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         r = min(max(my - term_y, 0) // cell_h, link.rows - 1)
         return c, r
 
+    def _sel_base():
+        # Absolute scrollback line number of the top displayed row. Rows in
+        # sel_anchor/sel_cells are absolute so the highlight stays glued to
+        # the text - scrolling (or new output pushing lines up) shifts the
+        # view, not the selection.
+        return sb_history - sb_offset
+
     def _sel_normalize(a, b):
         return (b, a) if (b[1], b[0]) < (a[1], a[0]) else (a, b)
 
@@ -518,13 +525,17 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         if not sel_cells:
             return ""
         (c0, r0), (c1, r1) = sel_cells
+        base = _sel_base()
         out = []
-        for r in range(r0, r1 + 1):
+        for r_abs in range(r0, r1 + 1):
+            r = r_abs - base
+            if r < 0:
+                continue
             if r >= len(last_lines):
                 break
             line = last_lines[r]
-            a = c0 if r == r0 else 0
-            b = c1 + 1 if r == r1 else link.cols
+            a = c0 if r_abs == r0 else 0
+            b = c1 + 1 if r_abs == r1 else link.cols
             out.append(line[a:b].rstrip())
         return "\r\n".join(out)
 
@@ -752,7 +763,9 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         pos = min(1.0, max(0.0, pos))
                         scroll_offset = int(round((1.0 - pos) * sb_history))
                 if sel_dragging:
-                    sel_cells = _sel_normalize(sel_anchor, _cell_at(*event.pos))
+                    sel_cells = _sel_normalize(
+                        sel_anchor, (_cell_at(*event.pos)[0],
+                                     _cell_at(*event.pos)[1] + _sel_base()))
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 scrollbar_drag = False
                 if sel_dragging:
@@ -859,7 +872,8 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         if active_menu_idx is not None:
                             active_menu_idx = None  # click only dismisses the menu
                         elif term_y <= my < term_y + term_h and mx < term_w:
-                            sel_anchor = _cell_at(mx, my)
+                            c, r = _cell_at(mx, my)
+                            sel_anchor = (c, r + _sel_base())
                             sel_cells = None
                             sel_dragging = True
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
@@ -1074,13 +1088,19 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         img = font.render(line, False, FG, BG)
                         surface.blit(img, (0, term_y + row * cell_h))
 
-            # Selection highlight (drawn over the text, under the cursor)
+            # Selection highlight (drawn over the text, under the cursor).
+            # sel_cells rows are absolute scrollback lines - map back to view
+            # rows so the highlight tracks the text through scrolls.
             if sel_cells:
                 (c0, r0), (c1, r1) = sel_cells
+                base = _sel_base()
                 overlay = pygame.Surface((term_w, term_h), pygame.SRCALPHA)
-                for r in range(r0, r1 + 1):
-                    a = c0 if r == r0 else 0
-                    b = c1 if r == r1 else link.cols - 1
+                for r_abs in range(r0, r1 + 1):
+                    r = r_abs - base
+                    if r < 0 or r >= link.rows:
+                        continue
+                    a = c0 if r_abs == r0 else 0
+                    b = c1 if r_abs == r1 else link.cols - 1
                     overlay.fill((255, 255, 255, 60),
                                  (a * cell_w, r * cell_h, (b - a + 1) * cell_w, cell_h))
                 surface.blit(overlay, (0, term_y))
