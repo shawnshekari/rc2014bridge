@@ -212,5 +212,106 @@ class TestScanDrives(unittest.TestCase):
         self.assertIn("not at CP/M prompt", res["error"])
 
 
+class TestScanDrivesZpm3(unittest.TestCase):
+    """On ZPM3 the scanner must speak the local dialect: SDZ for listings
+    (DIR can't address user areas), no STAT at all (it has no drive-space
+    form - capacities come from SDZ's own "Free: Nk" trailer)."""
+
+    def setUp(self):
+        self.fake = FakeSerial()
+        with patch("serial.Serial", return_value=self.fake):
+            self.link = SerialLink(
+                "/dev/fake",
+                hw_info_file=os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "hw.json"))
+        self.addCleanup(self.link.close)
+        self.link._system_state = "cpm"
+        self.link._zpm3 = True
+        self.link.hardware_info["drive_mappings"] = {"A": "IDE0:0", "B": "MD0:0"}
+        self.commands = []
+
+        def _responder(line: bytes):
+            cmd = line.decode("latin-1").strip().upper()
+            self.commands.append(cmd)
+            if cmd == "STAT":
+                return b"\r\nSTAT ?\r\n15:45 B0>"
+            if cmd == "SDZ A:":
+                return b"\r\nA0: ZPATH.COM  STAT.COM  XM.COM\r\nFree: 4412k\r\n15:45 B0>"
+            if cmd == "SDZ B:":
+                return b"\r\n >> No detectable file(s) on B0:   Free: 244k \r\n15:45 B0>"
+            return b"\r\n15:45 B0>"
+
+        self.fake.responder = _responder
+
+    def test_zpm3_scan_uses_sdz_and_reads_free_space_from_it(self):
+        res = self.link.scan_drives()
+        self.assertTrue(res["ok"], res)
+        drives = {d["drive"]: d for d in res["drives"]}
+
+        self.assertIn("ZPATH.COM", drives["A:"]["files_sample"])
+        self.assertEqual(drives["A:"]["free_space"], "4412k")
+        self.assertEqual(drives["B:"]["files_count"], 0)
+        self.assertEqual(drives["B:"]["free_space"], "244k")
+
+        self.assertTrue(any(c.startswith("SDZ") for c in self.commands))
+        self.assertFalse(any(c.startswith("DIR ") for c in self.commands))
+        self.assertNotIn("STAT", self.commands)
+
+
+class TestZpm3Banner(unittest.TestCase):
+    """ZPM3 announces itself at boot ('ZPM3 [BANKED] for HBIOS vX.Y'); no
+    ZSDOS/CBIOS strings appear on that path, so without parsing it a ZPM3
+    machine's OS never lands in hardware_info."""
+
+    def _link(self):
+        fake = FakeSerial()
+        with patch("serial.Serial", return_value=fake):
+            link = SerialLink(
+                "/dev/fake",
+                hw_info_file=os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "hw.json"))
+        self.addCleanup(link.close)
+        return link
+
+    def test_zpm3_banner_sets_version_and_flag(self):
+        link = self._link()
+        link._update_system_state(
+            "\r\nZPM3 [BANKED] for HBIOS v3.7.0-dev.12\r\n"
+            "** CTRL-V = XMODEM TRIGGER MOD **\r\n")
+        self.assertTrue(link._zpm3)
+        self.assertEqual(link.hardware_info["zpm3_version"], "ZPM3 for HBIOS v3.7.0-dev.12")
+        self.assertEqual(link.get_screen()["os"], "zpm3")
+
+    def test_fresh_boot_clears_a_stale_zpm3_flag(self):
+        link = self._link()
+        link._zpm3 = True
+        link._update_system_state("some old output\r\nRomWBW HBIOS v3.5.3\r\n")
+        self.assertFalse(link._zpm3)
+
+    def test_fresh_banner_at_buffer_start_also_clears(self):
+        # Reboot while connected: the banner can land at buffer position 0,
+        # and a "> 0" check misses that - a stale ZPM3 flag then survives a
+        # reboot into plain CP/M and the status bar lies.
+        link = self._link()
+        link._zpm3 = True
+        link.hardware_info["zpm3_version"] = "ZPM3 for HBIOS v3.7.0"
+        link._update_system_state("RomWBW HBIOS v3.7.0-dev.12\r\n")
+        self.assertFalse(link._zpm3)
+        self.assertNotIn("zpm3_version", link.hardware_info)
+
+    def test_plain_cpm_lines_do_not_flag_zpm3(self):
+        link = self._link()
+        # CP/M-80 v2.2 boot chatter + prompt, plus output with incidental
+        # digit:digit text - none of it is a ZPM3 prompt.
+        link._update_system_state("\r\nCP/M-80 v2.2, 54.0K TPA\r\nB>")
+        link._update_system_state("STAT report 10:45am-ish nonsense\r\nB>")
+        self.assertFalse(link._zpm3)
+        self.assertEqual(link.get_screen()["os"], "cpm")
+        self.assertEqual(link.hardware_info.get("cpm_version"), "CP/M-80 v2.2")
+
+    def test_zpm3_clock_prompt_still_flags(self):
+        link = self._link()
+        link._update_system_state("\x1b[1m15:21\x1b[m J1\x1b[1m\x1b[m>")
+        self.assertTrue(link._zpm3)
+
+
 if __name__ == "__main__":
     unittest.main()

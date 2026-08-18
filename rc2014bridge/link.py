@@ -105,6 +105,13 @@ _CPM = (rf"{_ANSI_M}*(?:\d{{1,2}}:\d{{2}}{_ANSI_M}*\s+)?{_ANSI_M}*"
 _HBIOS = r"HBIOS>|Boot(?:\s*\[[^\]]*\])?\s*:"
 _FLASH = r"FDU>|FLASH>|Command\?"
 
+# ZPM3 tells: a clock prefix at the very start of the prompt ("15:21 J1>"),
+# or a named directory ("A0:SYSTEM>"). The clock MUST be anchored - an
+# unanchored \d\d:\d\d matches incidental text (STAT output, timestamps in
+# file listings) and misflags plain CP/M as ZPM3.
+_ZPM3_CLOCK_RE = re.compile(rf"^{_ANSI_M}*\d{{1,2}}:\d{{2}}{_ANSI_M}*\s")
+_ZPM3_NAMED_RE = re.compile(r"[A-P][0-9]*:[A-Za-z0-9]+>")
+
 CPM_PROMPT_RE = re.compile(rf"^{_CPM}")
 # Looser: the boot banner's "A:=IDE0:0" drive-configuration lines also mean
 # an OS is coming up, so state detection accepts them too.
@@ -449,6 +456,11 @@ def _parse_zsdos_banner(text: str) -> dict:
     if m:
         info["tpa"] = m.group(1)
 
+    # Plain DRI CP/M announces itself too: "CP/M-80 v2.2, 54.0K TPA".
+    m = re.search(r"CP/M-80\s+(v[0-9.]+)", text, re.IGNORECASE)
+    if m:
+        info["cpm_version"] = f"CP/M-80 {m.group(1)}"
+
     drives = {}
     for line in text.splitlines():
         line_s = line.strip()
@@ -458,6 +470,16 @@ def _parse_zsdos_banner(text: str) -> dict:
     if drives:
         info["drive_mappings"] = drives
     return info
+
+
+def _parse_zpm3_banner(text: str) -> dict:
+    """ZPM3 announces itself at boot, e.g. 'ZPM3 [BANKED] for HBIOS
+    v3.7.0-dev.12' - no ZSDOS/CBIOS strings appear on that path, so without
+    this a ZPM3 machine's OS is never captured into hardware_info."""
+    m = re.search(r"ZPM3\s+(?:\[\w+\]\s+)?for\s+HBIOS\s+(v[\w.\-]+)", text, re.IGNORECASE)
+    if not m:
+        return {}
+    return {"zpm3_version": f"ZPM3 for HBIOS {m.group(1)}"}
 
 
 def _parse_survey_output(text: str) -> dict:
@@ -538,16 +560,28 @@ def _parse_cpm_dir_output(text: str) -> list[str]:
     ignored = {"NO", "FILE", "DIR", "BYTES", "FREE", "USAGE", "KB", "DRIVE", "UNIT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "STAT"}
     for line in text.splitlines():
         line_clean = re.sub(r"^[A-P]>", "", line.strip())
-        if "No File" in line_clean or "NO FILE" in line_clean or "Space:" in line_clean:
+        if "No File" in line_clean or "NO FILE" in line_clean or "Space:" in line_clean \
+                or "no detectable" in line_clean.lower():
             continue
         parts = re.split(r"[|:]", line_clean)
         for part in parts:
-            p_str = part.strip()
-            if not p_str:
-                continue
-            m = re.match(r"^([A-Z0-9_\$]{1,8})\s+\.?\s*([A-Z0-9_\$]{1,3})$", p_str, re.IGNORECASE)
-            if m:
-                name, ext = m.group(1).upper(), m.group(2).upper()
+            # DIR prints column pairs ("ZPATH    COM : STAT     COM"); SDZ
+            # (ZPM3) prints dotted names in plain columns ("ZPATH.COM STAT.COM").
+            tokens = part.split()
+            i = 0
+            while i < len(tokens):
+                m = re.match(r"^([A-Z0-9_\$]{1,8})\.([A-Z0-9_\$]{1,3})$", tokens[i], re.IGNORECASE)
+                if m:
+                    name, ext = m.group(1).upper(), m.group(2).upper()
+                    i += 1
+                elif (i + 1 < len(tokens)
+                        and re.fullmatch(r"[A-Z0-9_\$]{1,8}", tokens[i], re.IGNORECASE)
+                        and re.fullmatch(r"[A-Z0-9_\$]{1,3}", tokens[i + 1], re.IGNORECASE)):
+                    name, ext = tokens[i].upper(), tokens[i + 1].upper()
+                    i += 2
+                else:
+                    i += 1
+                    continue
                 if name not in ignored:
                     fname = f"{name}.{ext}"
                     if fname not in files:
@@ -954,6 +988,7 @@ class SerialLink:
         self._scan_progress = {"active": True, "drive": "", "index": 0,
                                "total": len(drives_to_scan) + 1}
         listings: dict[str, list[str]] = {}
+        zpm3_free: dict[str, str] = {}
         try:
             # DIR every drive *first*. CP/M's STAT only reports drives that have
             # been logged in, and a DIR is what logs one in - so asking STAT
@@ -964,20 +999,36 @@ class SerialLink:
                 self._scan_progress.update({"drive": f"{drv}:", "index": position})
                 # run_command already isolates this command's output, so there's
                 # no need to fish the DIR block back out of the screen history.
-                listing = self.run_command(f"DIR {drv}:", timeout=DIR_TIMEOUT)
+                # nudge_after: ZSDOS/ZPM3 page long listings by CRT height and
+                # then wait for a keystroke with no visible marker - without
+                # nudges a full drive comes back as just its first page.
+                listing = self.run_command(self._dir_command(f"{drv}:"),
+                                           timeout=DIR_TIMEOUT, nudge_after=1.0)
                 listings[drv] = _parse_cpm_dir_output(listing.get("output", ""))
+                if self._zpm3:
+                    # ZPM3's STAT has no drive-space form (bare "STAT" errors
+                    # with "STAT ?"), but every SDZ listing ends with a
+                    # "Free: Nk" trailer - capacities come from there instead.
+                    free = _parse_sdz_free_space(listing.get("output", ""))
+                    if free is not None:
+                        zpm3_free[drv] = f"{free // 1024}k"
 
-            self._scan_progress.update({"drive": "STAT", "index": len(drives_to_scan) + 1})
-            # STAT probes every logged-in drive before printing, so it is
-            # genuinely slow - ~6s for ten drives. Don't race it.
-            stat = self.run_command("STAT", timeout=STAT_TIMEOUT)
-            stat_data = _parse_stat_output(stat.get("output", ""))
-            if not stat_data:
-                # If STAT still outran its timeout, salvage whatever reached the
-                # screen rather than reporting every capacity as unknown.
-                logger.warning("STAT output not parseable (timed_out=%s); falling back to screen history",
-                               stat.get("timed_out"))
-                stat_data = _parse_stat_output(self._get_full_screen_history_text())
+            stat_data: dict = {}
+            if self._zpm3:
+                stat_data = {d: {"access": "", "free_space": v}
+                             for d, v in zpm3_free.items()}
+            else:
+                self._scan_progress.update({"drive": "STAT", "index": len(drives_to_scan) + 1})
+                # STAT probes every logged-in drive before printing, so it is
+                # genuinely slow - ~6s for ten drives. Don't race it.
+                stat = self.run_command("STAT", timeout=STAT_TIMEOUT)
+                stat_data = _parse_stat_output(stat.get("output", ""))
+                if not stat_data:
+                    # If STAT still outran its timeout, salvage whatever reached the
+                    # screen rather than reporting every capacity as unknown.
+                    logger.warning("STAT output not parseable (timed_out=%s); falling back to screen history",
+                                   stat.get("timed_out"))
+                    stat_data = _parse_stat_output(self._get_full_screen_history_text())
         finally:
             self._scan_progress = {"active": False, "drive": "", "index": 0, "total": 0}
 
@@ -1302,8 +1353,7 @@ class SerialLink:
                 logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
             self._system_state = "cpm"
             self._last_prompt = line_s
-            if re.search(r"\d{1,2}:\d{2}", line_s) or \
-                    re.search(r"[A-P][0-9]*:[A-Za-z0-9]+>", line_s):
+            if _ZPM3_CLOCK_RE.search(line_s) or _ZPM3_NAMED_RE.search(line_s):
                 self._zpm3 = True
         elif HBIOS_PROMPT_RE.search(line_s):
             if self._system_state != "hbios":
@@ -1320,13 +1370,23 @@ class SerialLink:
         self._check_for_baud_mismatch(text)
 
         self._boot_buffer += text
-        # A fresh banner means a new boot: drop everything before it, or the
-        # buffer keeps older banners and the parsers - which take the first match
-        # they find - report the previous firmware. That bit for real after a ROM
-        # update, where the board had booted v3.7.0 and this still said v3.5.0.
-        last_banner = self._boot_buffer.rfind("RomWBW HBIOS v")
-        if last_banner > 0:
-            self._boot_buffer = self._boot_buffer[last_banner:]
+        if "RomWBW HBIOS v" in text:
+            # A fresh banner means a new boot: drop everything before it, or
+            # the buffer keeps older banners and the parsers - which take the
+            # first match they find - report the previous firmware. That bit
+            # for real after a ROM update, where the board had booted v3.7.0
+            # and this still said v3.5.0. (Must trigger on "in text", not on
+            # rfind() > 0: a banner landing exactly at the buffer start is
+            # still a new boot - a stale _zpm3 flag otherwise survives a
+            # reboot from ZPM3 into plain CP/M.)
+            self._boot_buffer = self._boot_buffer[self._boot_buffer.rfind("RomWBW HBIOS v"):]
+            # A fresh boot re-decides the OS flavor - drop the stale flags so
+            # booting ZSDOS or CP/M-80 after ZPM3 (or vice versa) isn't
+            # misreported. The next banner/prompt sets them again.
+            self._zpm3 = False
+            self.hardware_info.pop("zpm3_version", None)
+            self.hardware_info.pop("zsdos_version", None)
+            self.hardware_info.pop("cpm_version", None)
         if len(self._boot_buffer) > 8192:
             self._boot_buffer = self._boot_buffer[-4096:]
 
@@ -1336,10 +1396,19 @@ class SerialLink:
                 self.hardware_info.update({k: v for k, v in parsed.items() if v})
                 self._save_hardware_info()
 
-        if "ZSDOS" in text or "CBIOS" in text or "Configuring Drives" in text:
+        if ("ZSDOS" in text or "CBIOS" in text or "CP/M-80" in text
+                or "Configuring Drives" in text):
             parsed_z = _parse_zsdos_banner(self._boot_buffer)
-            if parsed_z.get("zsdos_version") or parsed_z.get("drive_mappings"):
+            if (parsed_z.get("zsdos_version") or parsed_z.get("cpm_version")
+                    or parsed_z.get("drive_mappings")):
                 self.hardware_info.update({k: v for k, v in parsed_z.items() if v})
+                self._save_hardware_info()
+
+        if "ZPM3" in text:
+            parsed_z3 = _parse_zpm3_banner(self._boot_buffer)
+            if parsed_z3:
+                self.hardware_info.update(parsed_z3)
+                self._zpm3 = True
                 self._save_hardware_info()
 
         buf = self._rx_linebuf + text
@@ -1815,13 +1884,18 @@ class SerialLink:
 
     @_exclusive("command")
     def run_command(self, command: str, timeout: float = 15.0,
-                    idle_settle: float = 0.25) -> dict:
+                    idle_settle: float = 0.25, nudge_after: float = None) -> dict:
         """Send a command and return only the output it produced.
 
         One call per command: sends, waits for the prompt to come back, strips
         the board's echo and the trailing prompt. Interactive programs that
         don't return to a shell prompt (MBASIC, ED) will time out here - use
         send_text()/get_screen() for those.
+
+        nudge_after opts into silent-pager handling (see _wait_for_idle_prompt):
+        DIR/SDZ listings on ZSDOS/ZPM3 page by CRT height and block on a
+        keystroke with no visible marker, which otherwise reads as "still
+        running" until timeout and returns just the first page.
         """
         started = time.time()
         # Let anything still in flight land before snapshotting. Otherwise the
@@ -1832,7 +1906,8 @@ class SerialLink:
         start_pos = self.rx_position()
         self.send_text(command)
         res = self._wait_for_idle_prompt(start_pos, timeout, idle_settle,
-                                        after_echo=command.strip())
+                                        after_echo=command.strip(),
+                                        nudge_after=nudge_after)
         result = {
             "ok": not res["timed_out"],
             "command": command,
@@ -1841,6 +1916,7 @@ class SerialLink:
             "state": self._system_state,
             "duration_s": round(time.time() - started, 2),
             "timed_out": res["timed_out"],
+            "nudges": res["nudges"],
         }
 
         # The HBIOS boot loader acts on single letters, so a multi-character

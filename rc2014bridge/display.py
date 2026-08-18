@@ -1210,19 +1210,20 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             close_hint = status_font.render("[Esc/F5 to Close]", True, (180, 210, 240))
             surface.blit(close_hint, (box_x + box_w - close_hint.get_width() - 10, box_y + 6))
 
-            # Hardware & ZSDOS specs, as captured from the boot banner. Shown as
+            # Hardware & OS specs, as captured from the boot banner. Shown as
             # "not captured" rather than a plausible-looking guess, so the panel
             # never claims specs for a machine it hasn't actually read.
             y_curr = box_y + 38
             not_captured = "not captured - reboot to capture"
-            os_line = hw_info.get("zsdos_version") or ""
+            os_line = (hw_info.get("zpm3_version") or hw_info.get("zsdos_version")
+                       or hw_info.get("cpm_version") or "")
             if os_line and hw_info.get("tpa"):
                 os_line = f"{os_line} ({hw_info['tpa']})"
             lines_to_show = [
                 ("RomWBW Version:", hw_info.get("version") or not_captured),
                 ("CPU Architecture:", hw_info.get("cpu") or not_captured),
                 ("Memory / MMU:", hw_info.get("memory") or not_captured),
-                ("ZSDOS / CBIOS:", os_line or not_captured),
+                ("Operating System:", os_line or not_captured),
             ]
 
             for label, val in lines_to_show:
@@ -1234,7 +1235,7 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
 
             # Scanned Drive Inventory Table
             y_curr += 6
-            dev_hdr = menu_font.render(" Cataloged Disk Drive Inventory (F6 to Scan):", True, (140, 180, 220))
+            dev_hdr = menu_font.render(" Disk Drive Catalogue (F6 to Scan):", True, (140, 180, 220))
             surface.blit(dev_hdr, (box_x + 12, y_curr))
             y_curr += 24
 
@@ -1246,7 +1247,11 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     for k, v in list(drives_map.items())[:10]
                 ]
 
-            for drv in drives[:10]:
+            # Fit as many rows as the box has room for; say how many were
+            # clipped instead of silently dropping them.
+            row_h = 22
+            max_rows = max(1, (box_y + box_h - 12 - y_curr) // row_h)
+            for drv in drives[:max_rows]:
                 d_name = drv.get("drive", "")
                 d_dev = drv.get("device", "")
                 d_count = drv.get("files_count", 0)
@@ -1259,6 +1264,10 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                 surface.blit(lbl_img, (box_x + 12, y_curr))
                 surface.blit(purp_img, (box_x + 12 + lbl_img.get_width() + 10, y_curr))
                 y_curr += 22
+
+            if len(drives) > max_rows:
+                more_img = font.render(f"   ... and {len(drives) - max_rows} more drive(s)", True, (150, 170, 190))
+                surface.blit(more_img, (box_x + 12, y_curr))
 
         # --------------------------------------------------------------
         # 5b. Render Connection Settings Modal Overlay (if active)
