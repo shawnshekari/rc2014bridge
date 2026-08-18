@@ -83,6 +83,31 @@ class TestReconfigure(unittest.TestCase):
         self.assertIs(link._ser, fake1)
         self.assertTrue(fake1.is_open)
 
+    def test_same_port_reconfigure_closes_before_reopening(self):
+        # Windows refuses a second open of a port we already hold
+        # (PermissionError 13, "Access is denied"), so an in-place
+        # reconfigure - e.g. just toggling RTS/CTS - must close the old
+        # handle BEFORE opening the new one.
+        link, fake1 = _link(baud=115200)
+        self.addCleanup(link.close)
+
+        events = []
+        orig_close = fake1.close
+        def _close():
+            events.append("close")
+            orig_close()
+        fake1.close = _close
+
+        with patch("serial.Serial",
+                   side_effect=lambda *a, **kw: (events.append("open"), FakeSerial(*a, **kw))[1]):
+            res = link.reconfigure(rtscts=True)  # same port, same baud
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(events, ["close", "open"])
+        self.assertFalse(fake1.is_open)
+        self.assertTrue(link._ser.is_open)
+        self.assertTrue(link.rtscts)
+
     def test_reader_thread_survives_reconfigure(self):
         """The reader thread must not exit just because reconfigure() closed
         the port it was reading - only a real (unintended) disconnect should
@@ -164,6 +189,26 @@ class TestConnectionHelpers(unittest.TestCase):
             res = probe_serial_connection("/dev/nope", 115200)
         self.assertFalse(res["ok"])
         self.assertIn("no such device", res["error"])
+
+    def test_probe_connection_short_circuits_the_port_we_hold(self):
+        # The Settings screen probing our own port must not try to open it a
+        # second time - Windows denies that outright.
+        link, fake = _link(baud=115200)
+        self.addCleanup(link.close)
+        with patch("serial.Serial") as ctor:
+            res = link.probe_connection("/dev/fake", 115200)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["already_connected"])
+        ctor.assert_not_called()
+
+    def test_probe_connection_delegates_for_other_ports(self):
+        link, _ = _link(baud=115200)
+        self.addCleanup(link.close)
+        with patch("serial.Serial", return_value=FakeSerial()) as ctor:
+            res = link.probe_connection("/dev/other", 9600)
+        self.assertTrue(res["ok"])
+        self.assertNotIn("already_connected", res)
+        ctor.assert_called_once()
 
 
 class TestStartsDisconnected(unittest.TestCase):

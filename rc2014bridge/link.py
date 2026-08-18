@@ -1190,6 +1190,16 @@ class SerialLink:
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def probe_connection(self, port: str, baud: int, rtscts: bool = False) -> dict:
+        """Settings-screen probe that also works for the port this link is
+        already holding: an open port is its own proof of openability, and
+        Windows refuses a second open of the same COM port
+        (PermissionError 13), so the independent probe_serial_connection()
+        would always fail against our own port there."""
+        if port == self.port and self._ser.is_open:
+            return {"ok": True, "already_connected": True}
+        return probe_serial_connection(port, baud, rtscts)
+
     @_exclusive("reconfigure connection")
     def reconfigure(self, port: str = None, baud: int = None, rtscts: bool = None,
                      is_default_change: bool = True) -> dict:
@@ -1209,12 +1219,23 @@ class SerialLink:
         new_port = self.port if port is None else port
         new_baud = self.baud if baud is None else baud
         new_rtscts = self._ser.rtscts if rtscts is None else rtscts
+        if new_port == self.port and self._ser.is_open:
+            # Same-port reconfigure (e.g. only baud/RTS-CTS changed): Windows
+            # refuses a second open of a port we already hold
+            # (PermissionError 13, "Access is denied"), so close before
+            # reopening. Swap in a placeholder first so the read loop parks
+            # on is_open=False instead of reading a closing port.
+            with self._write_lock:
+                old_ser = self._ser
+                self._reinit_epoch += 1
+                self._ser = _DisconnectedSerial(new_port, baudrate=new_baud, rtscts=new_rtscts)
+            old_ser.close()
         try:
             new_ser = serial.Serial(new_port, baudrate=new_baud, bytesize=8, parity="N",
-                                     stopbits=1, timeout=0.1, rtscts=new_rtscts)
+                                     stopbits=1, timeout=0.02, rtscts=new_rtscts)
         except (serial.SerialException, OSError) as e:
             logger.warning("reconfigure(port=%r, baud=%r, rtscts=%r) failed: %s",
-                            port, baud, rtscts, e)
+                           new_port, new_baud, new_rtscts, e)
             return {"ok": False, "error": str(e)}
 
         # Swap under _write_lock so an in-flight _write_raw()/_write_paced()

@@ -25,7 +25,7 @@ import pygame
 from pygame._sdl2.video import Renderer, Texture, Window
 
 from rc2014bridge import config as bridge_config
-from rc2014bridge.link import list_serial_ports, probe_serial_connection
+from rc2014bridge.link import list_serial_ports
 
 FG = (229, 229, 229)
 FG_BOLD = (255, 255, 255)   # bold default-color text: bright white (industry convention)
@@ -594,9 +594,10 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
 
         def _worker():
             nonlocal settings_status
-            res = probe_serial_connection(port, baud, rtscts)
+            res = link.probe_connection(port, baud, rtscts)
             if res.get("ok"):
-                settings_status = (f"OK: {port} @ {baud} baud opened successfully", True)
+                note = " (already connected)" if res.get("already_connected") else ""
+                settings_status = (f"OK: {port} @ {baud} baud opened successfully{note}", True)
             else:
                 settings_status = (f"Failed: {res.get('error', 'unknown error')}", False)
 
