@@ -112,6 +112,13 @@ _FLASH = r"FDU>|FLASH>|Command\?"
 _ZPM3_CLOCK_RE = re.compile(rf"^{_ANSI_M}*\d{{1,2}}:\d{{2}}{_ANSI_M}*\s")
 _ZPM3_NAMED_RE = re.compile(r"[A-P][0-9]*:[A-Za-z0-9]+>")
 
+# Strings that only ever appear at the start of a fresh boot - used by
+# _update_system_state() to drop stale OS-flavor state. "RomWBW HBIOS v" is
+# the RomWBW firmware banner; SC126-class boards never print it, so their
+# loader banner ("... Boot Loader") and the "CBIOS v" line every CP/M-flavor
+# boot prints serve as markers there too.
+_NEW_BOOT_MARKERS = ("RomWBW HBIOS v", "Boot Loader", "CBIOS v")
+
 CPM_PROMPT_RE = re.compile(rf"^{_CPM}")
 # Looser: the boot banner's "A:=IDE0:0" drive-configuration lines also mean
 # an OS is coming up, so state detection accepts them too.
@@ -1370,16 +1377,22 @@ class SerialLink:
         self._check_for_baud_mismatch(text)
 
         self._boot_buffer += text
-        if "RomWBW HBIOS v" in text:
-            # A fresh banner means a new boot: drop everything before it, or
-            # the buffer keeps older banners and the parsers - which take the
-            # first match they find - report the previous firmware. That bit
-            # for real after a ROM update, where the board had booted v3.7.0
-            # and this still said v3.5.0. (Must trigger on "in text", not on
-            # rfind() > 0: a banner landing exactly at the buffer start is
-            # still a new boot - a stale _zpm3 flag otherwise survives a
-            # reboot from ZPM3 into plain CP/M.)
-            self._boot_buffer = self._boot_buffer[self._boot_buffer.rfind("RomWBW HBIOS v"):]
+        # A fresh boot banner means a new boot: drop everything before it, or
+        # the buffer keeps older banners and the parsers - which take the
+        # first match they find - report the previous firmware. That bit for
+        # real after a ROM update, where the board had booted v3.7.0 and this
+        # still said v3.5.0. (Must trigger on "in text", not on rfind() > 0:
+        # a banner landing exactly at the buffer start is still a new boot -
+        # a stale _zpm3 flag otherwise survives a reboot from ZPM3 into plain
+        # CP/M.) "RomWBW HBIOS v" is the RomWBW banner; SC126-class boards
+        # print neither that nor any RomWBW line - their loader announces
+        # itself with "... Boot Loader" and every CP/M-flavor boot then prints
+        # a "CBIOS v..." line, so those are new-boot markers too. ZPM3/ZSDOS
+        # boots print their own sign-on AFTER the CBIOS line, so clearing the
+        # flags here can't hide them - they re-set below in the same boot.
+        marker = next((m for m in _NEW_BOOT_MARKERS if m in text), None)
+        if marker:
+            self._boot_buffer = self._boot_buffer[self._boot_buffer.rfind(marker):]
             # A fresh boot re-decides the OS flavor - drop the stale flags so
             # booting ZSDOS or CP/M-80 after ZPM3 (or vice versa) isn't
             # misreported. The next banner/prompt sets them again.

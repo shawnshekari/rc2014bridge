@@ -312,6 +312,28 @@ class TestZpm3Banner(unittest.TestCase):
         link._update_system_state("\x1b[1m15:21\x1b[m J1\x1b[1m\x1b[m>")
         self.assertTrue(link._zpm3)
 
+    def test_sc126_cpm_boot_clears_stale_zpm3(self):
+        # SC126 boots never print "RomWBW HBIOS v" - the loader banner and the
+        # CBIOS line are the only new-boot markers, and without them a stale
+        # ZPM3 flag from the previous session survived a reboot into CP/M-80.
+        link = self._link()
+        link._zpm3 = True
+        link.hardware_info["zpm3_version"] = "ZPM3 for HBIOS v3.7.0"
+        link._update_system_state(
+            "Small Computer SC126 [SCZ180_sc126_std] Boot Loader\r\r\n"
+            "Boot [H=Help]: c\r\r\n"
+            "Loading CP/M 2.2...\r\r\n"
+            "CBIOS v3.7.0-dev.12 [WBW]\r\r\n"
+            "Configuring Drives...\r\r\n"
+            "    A:=MD0:0\r\r\n    B:=MD1:0\r\r\n"
+            "    1859 Disk Buffer Bytes Free\r\r\n"
+            "CP/M-80 v2.2, 54.0K TPA\r\r\n"
+            "B>")
+        self.assertFalse(link._zpm3)
+        self.assertNotIn("zpm3_version", link.hardware_info)
+        self.assertEqual(link.hardware_info.get("cpm_version"), "CP/M-80 v2.2")
+        self.assertEqual(link.get_screen()["os"], "cpm")
+
 
 if __name__ == "__main__":
     unittest.main()
