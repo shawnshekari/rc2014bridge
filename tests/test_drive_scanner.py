@@ -364,6 +364,40 @@ class TestZpm3Banner(unittest.TestCase):
         self.assertFalse(link._zpm3)
         self.assertEqual(link._system_state, "unknown")
 
+    def test_zsdos_boot_captured_despite_split_keyword(self):
+        # The "ZSDOS" trigger word itself can straddle two reads; a
+        # chunk-scoped trigger then never fires and zsdos_version stays unset
+        # (seen live: badge read CPM through a whole Z-System session).
+        link = self._link()
+        link._update_system_state(
+            "RomWBW HBIOS v3.7.0-dev.12, 2026-08-10\r\n"
+            "Small Computer SC126 [SCZ180_sc126_std] Boot Loader\r\n"
+            "Boot [H=Help]: z\r\n"
+            "Loading Z-System...\r\n"
+            "CBIOS v3.7.0-dev.12 [WBW]\r\n"
+            "Configuring Drives...\r\n"
+            "  A:=MD0:0\r\n  B:=MD1:0\r\n"
+            "  1859 Disk Buffer Bytes Free\r\n"
+            "ZSD")
+        self.assertNotIn("zsdos_version", link.hardware_info)
+        link._update_system_state("OS v1.1, 54.0K TPA\r\n\r\nB>")
+        self.assertEqual(link.hardware_info.get("zsdos_version"),
+                         "ZSDOS v1.1, 54.0K TPA")
+        self.assertEqual(link.get_screen()["os"], "zsdos")
+
+    def test_unit_table_survives_loader_marker(self):
+        # The "Boot Loader" marker fires mid-boot, after the unit table - the
+        # parse region must still reach back to the RomWBW banner, or the
+        # device list stops updating.
+        link = self._link()
+        link._update_system_state(
+            "RomWBW HBIOS v3.7.0-dev.12, 2026-08-10\r\n"
+            "ASCI0: IO=0xC0 ASCI MODE=115200,8,N,1\r\n"
+            "SD0: SDSC NAME=SD512 BLOCKS=0x000F4400 SIZE=488MB\r\n"
+            "Small Computer SC126 [SCZ180_sc126_std] Boot Loader\r\n"
+            "Boot [H=Help]:")
+        self.assertTrue(link.hardware_info.get("devices"))
+
 
 if __name__ == "__main__":
     unittest.main()

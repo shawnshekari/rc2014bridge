@@ -884,6 +884,23 @@ class SerialLink:
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+    def _merge_hw_info(self, parsed: dict):
+        """Merge parsed banner fields into hardware_info, saving on change.
+
+        The banner parsers run on every received chunk (their triggers look at
+        the accumulated boot region, immune to reads splitting a keyword), so
+        compare field-by-field and only touch the dict - and the JSON file -
+        when a value actually changes. "timestamp" rides along on real changes
+        but never triggers one by itself.
+        """
+        new = {k: v for k, v in parsed.items() if v and k != "timestamp"}
+        if not any(self.hardware_info.get(k) != v for k, v in new.items()):
+            return
+        if parsed.get("timestamp"):
+            new["timestamp"] = parsed["timestamp"]
+        self.hardware_info.update(new)
+        self._save_hardware_info()
+
     def _save_hardware_info(self):
         # The reader thread calls this on every chunk that looks like a banner
         # line, so skip the write unless something actually changed.
@@ -1383,19 +1400,19 @@ class SerialLink:
 
         self._boot_buffer += text
         self._rx_bytes_total += len(text)
-        # A fresh boot banner means a new boot: drop everything before it, or
-        # the buffer keeps older banners and the parsers - which take the
-        # first match they find - report the previous firmware. That bit for
-        # real after a ROM update, where the board had booted v3.7.0 and this
-        # still said v3.5.0. "RomWBW HBIOS v" is the RomWBW banner; the loader
-        # banner ("... Boot Loader") and the "CBIOS v" line every CP/M-flavor
-        # boot prints serve as markers too. ZPM3/ZSDOS boots print their own
-        # sign-on AFTER the CBIOS line, so clearing the flags here can't hide
-        # them - they re-set below in the same boot.
-        # The banner can straddle two reads, so search the accumulated buffer,
-        # not just this chunk, and track the absolute position of the last
-        # occurrence actioned so each banner fires exactly once (buffer cuts
-        # keep positions consistent because the base is recomputed per call).
+        # A fresh boot banner means a new boot: re-decide the OS flavor from
+        # scratch so booting ZSDOS or CP/M-80 after ZPM3 (or vice versa) isn't
+        # misreported - drop the stale flags and cached versions; the banners
+        # and prompts below set them again within the same boot. The state
+        # too: during boot chatter the machine is at no prompt, and keeping
+        # the old one made the badge claim "CPM" (or ZPM3) while the loader
+        # was still printing hardware probe lines. "RomWBW HBIOS v" is the
+        # RomWBW banner; the loader banner ("... Boot Loader") and the "CBIOS
+        # v" line every CP/M-flavor boot prints serve as markers too.
+        # The banner can straddle two serial reads, so search the accumulated
+        # buffer rather than this chunk, and track the absolute position of
+        # the last occurrence actioned so each banner fires exactly once (the
+        # base is recomputed per call, so buffer truncation stays consistent).
         base = self._rx_bytes_total - len(self._boot_buffer)
         marker = None
         marker_abs = self._last_marker_fired_at
@@ -1405,13 +1422,6 @@ class SerialLink:
                 marker, marker_abs = m, base + idx
         if marker:
             self._last_marker_fired_at = marker_abs
-            self._boot_buffer = self._boot_buffer[marker_abs - base:]
-            # A fresh boot re-decides the OS flavor - drop the stale flags so
-            # booting ZSDOS or CP/M-80 after ZPM3 (or vice versa) isn't
-            # misreported. The next banner/prompt sets them again. The state
-            # too: during boot chatter the machine is at no prompt, and
-            # keeping the old one made the badge claim "CPM" (or ZPM3) while
-            # the loader was still printing hardware probe lines.
             self._zpm3 = False
             self._system_state = "unknown"
             self.hardware_info.pop("zpm3_version", None)
@@ -1420,26 +1430,36 @@ class SerialLink:
         if len(self._boot_buffer) > 8192:
             self._boot_buffer = self._boot_buffer[-4096:]
 
-        if "RomWBW" in text or "HBIOS" in text or "Boot:" in text or "Boot [" in text:
-            parsed = _parse_boot_banner(self._boot_buffer)
-            if parsed.get("version") or parsed.get("devices"):
-                self.hardware_info.update({k: v for k, v in parsed.items() if v})
-                self._save_hardware_info()
+        # Parse only the current boot's text: everything from the last RomWBW
+        # banner on (or, on hypothetical banner-less boot paths, from the last
+        # fallback marker). Older boots stay in the buffer for the baud-follow
+        # logic but must not shadow this boot's values in the parsers, which
+        # take the first match they find.
+        anchor = self._boot_buffer.rfind("RomWBW HBIOS v")
+        if anchor < 0:
+            anchor = max(self._boot_buffer.rfind(m) for m in _NEW_BOOT_MARKERS)
+        region = self._boot_buffer[anchor:] if anchor >= 0 else self._boot_buffer
 
-        if ("ZSDOS" in text or "CBIOS" in text or "CP/M-80" in text
-                or "Configuring Drives" in text):
-            parsed_z = _parse_zsdos_banner(self._boot_buffer)
+        # The parse triggers look at the whole region too, not just this
+        # chunk - a read can split a keyword anywhere ("ZSD" + "OS v1.1"),
+        # and a chunk-scoped trigger then silently never fires. Seen live: a
+        # ZSDOS boot left zsdos_version unset and the badge read CPM.
+        if any(k in region for k in ("RomWBW", "HBIOS", "Boot:", "Boot [")):
+            parsed = _parse_boot_banner(region)
+            if parsed.get("version") or parsed.get("devices"):
+                self._merge_hw_info(parsed)
+
+        if any(k in region for k in ("ZSDOS", "CBIOS", "CP/M-80", "Configuring Drives")):
+            parsed_z = _parse_zsdos_banner(region)
             if (parsed_z.get("zsdos_version") or parsed_z.get("cpm_version")
                     or parsed_z.get("drive_mappings")):
-                self.hardware_info.update({k: v for k, v in parsed_z.items() if v})
-                self._save_hardware_info()
+                self._merge_hw_info(parsed_z)
 
-        if "ZPM3" in text:
-            parsed_z3 = _parse_zpm3_banner(self._boot_buffer)
+        if "ZPM3" in region:
+            parsed_z3 = _parse_zpm3_banner(region)
             if parsed_z3:
-                self.hardware_info.update(parsed_z3)
+                self._merge_hw_info(parsed_z3)
                 self._zpm3 = True
-                self._save_hardware_info()
 
         buf = self._rx_linebuf + text
         lines = buf.split("\n")
