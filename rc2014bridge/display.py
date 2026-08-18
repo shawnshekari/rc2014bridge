@@ -1235,8 +1235,12 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             # never claims specs for a machine it hasn't actually read.
             y_curr = box_y + 38
             not_captured = "not captured - reboot to capture"
-            os_line = (hw_info.get("zpm3_version") or hw_info.get("zsdos_version")
-                       or hw_info.get("cpm_version") or "")
+            os_line = (hw_info.get("nzcom_version") or hw_info.get("z3plus_version")
+                       or hw_info.get("zpm3_version") or hw_info.get("cpm3_version")
+                       or hw_info.get("zsdos_version") or hw_info.get("cpm_version")
+                       or "")
+            if os_line and hw_info.get("boot_volume"):
+                os_line = f"{os_line} - volume {hw_info['boot_volume']}"
             if os_line and hw_info.get("tpa"):
                 os_line = f"{os_line} ({hw_info['tpa']})"
             lines_to_show = [
@@ -1411,11 +1415,13 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             badge_bg = (30, 110, 180)
             badge_fg = (210, 240, 255)
         elif sys_env == "CPM":
-            # Report the actual OS flavor, not just the family: ZPM3 speaks a
-            # different command dialect (SDZ/ERASE/UNZIPZ /E), and seeing which
-            # one is up explains which commands will work.
+            # Report the actual OS environment, not just the family: the
+            # ZCPR3 crowd (ZPM3/NZ-COM/Z3PLUS) speaks a different command
+            # dialect (SDZ/ERASE/UNZIPZ /E), and seeing which one is up
+            # explains which commands will work.
             os_flavor = state.get("os", "")
-            mode_label = {"zpm3": "ZPM3", "zsdos": "CPM/ZSDOS"}.get(os_flavor, "CPM")
+            mode_label = {"zpm3": "ZPM3", "nzcom": "NZ-COM", "z3plus": "Z3PLUS",
+                          "cpm3": "CP/M 3", "zsdos": "ZSDOS"}.get(os_flavor, "CPM")
             badge_bg = (24, 85, 45)
             badge_fg = (140, 255, 170)
         elif sys_env == "HBIOS":

@@ -411,5 +411,97 @@ class TestZpm3Banner(unittest.TestCase):
         self.assertEqual(link._system_state, "unknown")
 
 
+class TestOsEnvironments(unittest.TestCase):
+    """Every bootable slice/environment names itself somewhere in the boot
+    transcript - capture from real SC126 sessions. The badge follows the
+    outermost layer: NZ-COM layers on ZSDOS, Z3PLUS layers on CP/M 3."""
+
+    def _link(self):
+        fake = FakeSerial()
+        with patch("serial.Serial", return_value=fake):
+            link = SerialLink(
+                "/dev/fake",
+                hw_info_file=os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "hw.json"))
+        self.addCleanup(link.close)
+        return link
+
+    def test_nzcom_slice_boot(self):
+        # Slice 4.0: ZSDOS signs on, then the startup script loads NZ-COM.
+        link = self._link()
+        link._update_system_state(
+            'Volume "NZ-COM" [0xD000-0xFE00, entry @ 0xE600]...\r\n'
+            "CBIOS v3.7.0-dev.8 [WBW]\r\n"
+            "Configuring Drives...\r\n  A:=SD0:0\r\n"
+            "ZSDOS v1.1, 54.0K TPA\r\n\r\n"
+            "A$NZCOM NZCOM.ZCM\r\n"
+            "NZCOM Version 1.2 System Loader for Z-Com v2.0\r\n"
+            "  Loading A0:NZCOM.LBR|NZCPR.ZRL for B900 at 4C00\r\n"
+            "   Booting NZ-COM...\r\n\r\n"
+            "ZPATH  v1.1   4 Jul 93 (ZSDOS 1.1)\r\n"
+            "A0:SYSTEM>")
+        self.assertEqual(link.get_screen()["os"], "nzcom")
+        self.assertEqual(link.hardware_info.get("nzcom_version"),
+                         "NZ-COM 1.2 (Z-Com v2.0)")
+        self.assertEqual(link.hardware_info.get("boot_volume"), "NZ-COM")
+        # NZ-COM speaks the ZCPR3 dialect (SDZ/ERASE), same as ZPM3.
+        self.assertTrue(link._zpm3)
+
+    def test_z3plus_slice_boot(self):
+        # Slice 4.8: CP/M Plus (3.0) boots first, then z3plus layers on top.
+        link = self._link()
+        link._update_system_state(
+            'Volume "Z3PLUS" [0x0100-0x1000, entry @ 0x0100]...\r\n'
+            "CP/M V3.0 Loader\r\n"
+            " BNKBIOS3 SPR  F400  0A00\r\n"
+            " 59K TPA\r\n\r\n"
+            "CP/M v3.0 [BANKED] for HBIOS v3.7.0-dev.8\r\n\r\n"
+            "A>z3plus\r\n\r\n"
+            "                             ---  Z3PLUS  ---\r\n"
+            "                    The Z-System for CP/M PLUS (CP/M 3)\r\n"
+            "                  Vers. 1.02    (c) 1988 Bridger Mitchell\r\n"
+            "A0:SYSTEM>")
+        self.assertEqual(link.get_screen()["os"], "z3plus")
+        self.assertEqual(link.hardware_info.get("z3plus_version"),
+                         "Z3PLUS 1.02 (CP/M Plus)")
+        self.assertEqual(link.hardware_info.get("cpm3_version"),
+                         "CP/M v3.0 [BANKED] for HBIOS v3.7.0-dev.8")
+        self.assertEqual(link.hardware_info.get("boot_volume"), "Z3PLUS")
+
+    def test_app_slice_reports_zsdos_and_volume(self):
+        # Slice 4.2 (Turbo Pascal): plain ZSDOS underneath; the Volume line is
+        # the only place the slice name appears.
+        link = self._link()
+        link._update_system_state(
+            'Volume "Turbo Pascal" [0xD000-0xFE00, entry @ 0xE600]...\r\n'
+            "CBIOS v3.7.0-dev.8 [WBW]\r\n"
+            "ZSDOS v1.1, 54.0K TPA\r\n\r\nA>")
+        self.assertEqual(link.get_screen()["os"], "zsdos")
+        self.assertEqual(link.hardware_info.get("boot_volume"), "Turbo Pascal")
+
+    def test_nzcom_started_by_hand_from_zsdos(self):
+        # The user ran NZCOM at a ZSDOS prompt - no boot marker involved, the
+        # banner alone must move the badge off ZSDOS.
+        link = self._link()
+        link._update_system_state("ZSDOS v1.1, 54.0K TPA\r\n\r\nA>")
+        self.assertEqual(link.get_screen()["os"], "zsdos")
+        link._update_system_state(
+            "NZCOM Version 1.2 System Loader for Z-Com v2.0\r\n"
+            "   Booting NZ-COM...\r\n\r\nA0:SYSTEM>")
+        self.assertEqual(link.get_screen()["os"], "nzcom")
+
+    def test_new_boot_clears_environment_and_volume(self):
+        link = self._link()
+        link._update_system_state(
+            'Volume "Z3PLUS" [0x0100-0x1000, entry @ 0x0100]...\r\n'
+            "CP/M v3.0 [BANKED] for HBIOS v3.7.0-dev.8\r\n"
+            "A0:SYSTEM>")
+        self.assertEqual(link.get_screen()["os"], "cpm3")
+        link._update_system_state("\r\nRomWBW HBIOS v3.7.0-dev.12\r\n")
+        self.assertIsNone(link._os_env)
+        for key in ("cpm3_version", "z3plus_version", "nzcom_version",
+                    "boot_volume"):
+            self.assertNotIn(key, link.hardware_info)
+
+
 if __name__ == "__main__":
     unittest.main()

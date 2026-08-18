@@ -767,6 +767,11 @@ class SerialLink:
         self._pending_hbios_baud: int | None = None
         # ZPM3 (ZCPR/CP/M+) cannot DIR user areas - use SDZ there instead.
         self._zpm3 = False
+        # Which OS environment is actually up, for the badge: set from boot
+        # banners (latest one wins, so layered environments like ZSDOS->NZ-COM
+        # or CP/M3->Z3PLUS end on the outermost layer), falling back to the
+        # ZCPR3 prompt shape. None until something identifies itself.
+        self._os_env = None
         self.hardware_info = self._load_hardware_info()
 
         # An explicit setting wins; otherwise reuse whatever calibrate_pacing()
@@ -1384,6 +1389,11 @@ class SerialLink:
             self._last_prompt = line_s
             if _ZPM3_CLOCK_RE.search(line_s) or _ZPM3_NAMED_RE.search(line_s):
                 self._zpm3 = True
+                if self._os_env is None:
+                    # ZCPR3-style prompt with no banner captured (attached
+                    # mid-session, banner scrolled off) - best guess is the
+                    # family name; a banner later overrides it.
+                    self._os_env = "zpm3"
         elif HBIOS_PROMPT_RE.search(line_s):
             if self._system_state != "hbios":
                 logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
@@ -1414,8 +1424,9 @@ class SerialLink:
         # the last occurrence actioned so each banner fires exactly once (the
         # base is recomputed per call, so buffer truncation stays consistent).
         base = self._rx_bytes_total - len(self._boot_buffer)
+        prev_fired = self._last_marker_fired_at
         marker = None
-        marker_abs = self._last_marker_fired_at
+        marker_abs = prev_fired
         for m in _NEW_BOOT_MARKERS:
             idx = self._boot_buffer.rfind(m)
             if idx >= 0 and base + idx > marker_abs:
@@ -1423,10 +1434,35 @@ class SerialLink:
         if marker:
             self._last_marker_fired_at = marker_abs
             self._zpm3 = False
+            self._os_env = None
             self._system_state = "unknown"
+            # The pending line tail is pre-boot text (typically the old OS's
+            # prompt, sitting newline-less). Gluing it to the boot chatter
+            # would re-process it as a fresh line and re-flag the old flavor
+            # right after we cleared it.
+            self._rx_linebuf = ""
             self.hardware_info.pop("zpm3_version", None)
             self.hardware_info.pop("zsdos_version", None)
             self.hardware_info.pop("cpm_version", None)
+            self.hardware_info.pop("cpm3_version", None)
+            self.hardware_info.pop("nzcom_version", None)
+            self.hardware_info.pop("z3plus_version", None)
+            self.hardware_info.pop("boot_volume", None)
+            # The loader names the disk volume it boots ('Volume "Turbo
+            # Pascal"') just BEFORE the CBIOS line, so a marker-anchored
+            # forward scan can never see it. On a CBIOS marker, look back
+            # from the marker (but not past the previous boot's marker) to
+            # recover it. Other markers mean a fresh boot sequence is just
+            # starting - everything before them is the old boot, so no
+            # backward capture there. For app slices this Volume line is the
+            # only place the slice name appears.
+            if marker == "CBIOS v":
+                mrel = marker_abs - base
+                vidx = self._boot_buffer.rfind('Volume "', max(0, prev_fired - base), mrel)
+                if vidx >= 0:
+                    vend = self._boot_buffer.find('"', vidx + 8)
+                    if 0 < vend <= mrel:
+                        self._merge_hw_info({"boot_volume": self._boot_buffer[vidx + 8:vend]})
         if len(self._boot_buffer) > 8192:
             self._boot_buffer = self._boot_buffer[-4096:]
 
@@ -1454,12 +1490,53 @@ class SerialLink:
             if (parsed_z.get("zsdos_version") or parsed_z.get("cpm_version")
                     or parsed_z.get("drive_mappings")):
                 self._merge_hw_info(parsed_z)
+            if parsed_z.get("zsdos_version"):
+                self._os_env = "zsdos"
+            elif parsed_z.get("cpm_version"):
+                self._os_env = "cpm"
+
+        # Environment banners. Scan from this boot's marker (the whole buffer
+        # when none ever fired) so a previous boot's banners cannot re-fire
+        # after the marker block cleared them. These run on every chunk, so
+        # the LAST block whose banner is present wins - that ordering matches
+        # the layering: CP/M 3 boots first, then Z3PLUS layers on top; ZSDOS
+        # boots first, then NZ-COM layers on top.
+        boot_start = self._last_marker_fired_at - base
+        scan = self._boot_buffer[boot_start:] if boot_start >= 0 else self._boot_buffer
+
+        # Forward Volume capture: covers boot paths with no CBIOS line (CP/M 3
+        # boots its own loader), where the Volume line DOES land after the
+        # last fired marker. CBIOS boots are handled by the backward capture
+        # in the marker block above.
+        vm = re.findall(r'Volume "([^"]+)"', scan)
+        if vm:
+            self._merge_hw_info({"boot_volume": vm[-1]})
+
+        m3 = re.search(r"(CP/M v3\.0 \[BANKED\] for HBIOS v[\w.\-]+)", scan)
+        if m3:
+            self._merge_hw_info({"cpm3_version": m3.group(1)})
+            self._os_env = "cpm3"
 
         if "ZPM3" in region:
             parsed_z3 = _parse_zpm3_banner(region)
             if parsed_z3:
                 self._merge_hw_info(parsed_z3)
                 self._zpm3 = True
+                self._os_env = "zpm3"
+
+        if "NZCOM" in region or "NZ-COM" in region:
+            nzm = re.search(r"NZCOM Version ([\d.]+) System Loader for ([\w\-. ]+?)[\r\n]",
+                            region)
+            if nzm:
+                self._merge_hw_info(
+                    {"nzcom_version": f"NZ-COM {nzm.group(1)} ({nzm.group(2).strip()})"})
+            if "Booting NZ-COM" in region:
+                self._os_env = "nzcom"
+
+        z3m = re.search(r"Z3PLUS.*?Vers\.\s*([\d.]+)", region, re.DOTALL)
+        if z3m:
+            self._merge_hw_info({"z3plus_version": f"Z3PLUS {z3m.group(1)} (CP/M Plus)"})
+            self._os_env = "z3plus"
 
         buf = self._rx_linebuf + text
         lines = buf.split("\n")
@@ -1845,12 +1922,15 @@ class SerialLink:
                 "connected": self._ser.is_open,
                 "rx_active": rx_active, "tx_active": tx_active,
                 "system_state": self._system_state, "last_prompt": self._last_prompt,
-                # Which CP/M-flavored OS is up: ZPM3 from its prompt shape,
-                # ZSDOS from its boot banner, else plain CP/M.
-                "os": ("zpm3" if self._zpm3
-                       else "zsdos" if self.hardware_info.get("zsdos_version")
-                       else "cpm" if self._system_state == "cpm"
-                       else ""),
+                # Which OS environment is up: the boot banners decide (latest
+                # layer wins - NZ-COM over ZSDOS, Z3PLUS over CP/M 3); with no
+                # banner seen, fall back to the ZCPR3 prompt shape, then the
+                # cached ZSDOS sign-on, then bare CP/M.
+                "os": (self._os_env
+                       or ("zpm3" if self._zpm3
+                           else "zsdos" if self.hardware_info.get("zsdos_version")
+                           else "cpm" if self._system_state == "cpm"
+                           else "")),
                 "current_op": self._current_op,
                 "xmodem_progress": dict(self._xmodem_progress)}
 
