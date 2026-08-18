@@ -318,9 +318,17 @@ class TestZpm3Banner(unittest.TestCase):
         # ZPM3 flag from the previous session survived a reboot into CP/M-80.
         link = self._link()
         link._zpm3 = True
+        link._system_state = "cpm"
         link.hardware_info["zpm3_version"] = "ZPM3 for HBIOS v3.7.0"
         link._update_system_state(
-            "Small Computer SC126 [SCZ180_sc126_std] Boot Loader\r\r\n"
+            "Small Computer SC126 [SCZ180_sc126_std] Boot Loader\r\r\n")
+        # The boot marker alone drops the stale flavor and state - during boot
+        # chatter the machine is at no prompt, so the badge must not keep
+        # claiming the previous OS.
+        self.assertFalse(link._zpm3)
+        self.assertEqual(link._system_state, "unknown")
+        self.assertNotIn("zpm3_version", link.hardware_info)
+        link._update_system_state(
             "Boot [H=Help]: c\r\r\n"
             "Loading CP/M 2.2...\r\r\n"
             "CBIOS v3.7.0-dev.12 [WBW]\r\r\n"

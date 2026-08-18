@@ -1395,8 +1395,12 @@ class SerialLink:
             self._boot_buffer = self._boot_buffer[self._boot_buffer.rfind(marker):]
             # A fresh boot re-decides the OS flavor - drop the stale flags so
             # booting ZSDOS or CP/M-80 after ZPM3 (or vice versa) isn't
-            # misreported. The next banner/prompt sets them again.
+            # misreported. The next banner/prompt sets them again. The state
+            # too: during boot chatter the machine is at no prompt, and
+            # keeping the old one made the badge claim "CPM" (or ZPM3) while
+            # the loader was still printing hardware probe lines.
             self._zpm3 = False
+            self._system_state = "unknown"
             self.hardware_info.pop("zpm3_version", None)
             self.hardware_info.pop("zsdos_version", None)
             self.hardware_info.pop("cpm_version", None)
