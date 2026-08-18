@@ -94,7 +94,14 @@ BOOT_SETTLE_TIMEOUT = 20.0
 # CP/M prompts carry the user area when it isn't 0, and the two orderings both
 # occur in the wild: "2A>" and - on RomWBW/ZSDOS - "C2>". Accept either, or every
 # command run outside user area 0 waits out its timeout.
-_CPM = r"[0-9]*[A-P][0-9]*>"
+# ZPM3 (Simeon Cran ZCPR for CP/M+) adds a clock prefix and an optional named
+# directory - "11:26 J1>", "13:47 A0:SYSTEM>" - and wraps segments in ANSI bold
+# escapes ("\x1b[1m" / "\x1b[m") which survive into the raw receive log that
+# run_command() matches against. The escape runs and the prefix are all
+# optional, so the plain ZSDOS forms keep matching unchanged.
+_ANSI_M = r"(?:\x1b\[[0-9;]*m)"
+_CPM = (rf"{_ANSI_M}*(?:\d{{1,2}}:\d{{2}}{_ANSI_M}*\s+)?{_ANSI_M}*"
+        rf"[0-9]*[A-P][0-9]*(?::[A-Za-z0-9]+)?{_ANSI_M}*>")
 _HBIOS = r"HBIOS>|Boot(?:\s*\[[^\]]*\])?\s*:"
 _FLASH = r"FDU>|FLASH>|Command\?"
 
@@ -252,6 +259,17 @@ def _parse_stat_free_space(text: str) -> int | None:
     reported A0:'s free space). STAT <drive>: is what actually varies by
     drive."""
     m = _STAT_FREE_SPACE_RE.search(text)
+    return int(m.group(1)) * 1024 if m else None
+
+
+_SDZ_FREE_SPACE_RE = re.compile(r"Free:\s*(\d+)k", re.IGNORECASE)
+
+
+def _parse_sdz_free_space(text: str) -> int | None:
+    """Bytes free from ZPM3 SDZ's 'Free: 248k' trailer. ZPM3's STAT has no
+    drive-space form ('STAT B:' just errors), so SDZ - which already prints
+    free space on every listing - is the source there."""
+    m = _SDZ_FREE_SPACE_RE.search(text)
     return int(m.group(1)) * 1024 if m else None
 
 
@@ -647,9 +665,12 @@ class SerialLink:
         self._last_garbage_recovery_at = 0.0
         self.cols, self.rows = cols, rows
         self.hw_info_file = hw_info_file
+        # timeout=0.02 (not the usual 0.1): the read loop drains in_waiting
+        # and only blocks briefly for 1 byte, so output streams smoothly
+        # instead of arriving in 100ms lumps.
         try:
             self._ser = serial.Serial(port, baudrate=baud, bytesize=8, parity="N",
-                                       stopbits=1, timeout=0.1, rtscts=rtscts)
+                                       stopbits=1, timeout=0.02, rtscts=rtscts)
         except (serial.SerialException, OSError) as e:
             logger.warning("Could not open serial port %r: %s - starting "
                             "disconnected; use Connection Settings to pick "
@@ -703,6 +724,8 @@ class SerialLink:
         # confirmation is seen and the bridge has followed suit - see
         # _update_system_state()/_follow_hbios_baud_change().
         self._pending_hbios_baud: int | None = None
+        # ZPM3 (ZCPR/CP/M+) cannot DIR user areas - use SDZ there instead.
+        self._zpm3 = False
         self.hardware_info = self._load_hardware_info()
 
         # An explicit setting wins; otherwise reuse whatever calibrate_pacing()
@@ -715,6 +738,10 @@ class SerialLink:
         logger.info("Write pacing: text=%s xmodem=%s", self.text_pacing, self.xmodem_pacing)
         self._hw_snapshot = json.dumps(self.hardware_info, sort_keys=True)
         self._boot_buffer = ""
+        # Half-received console line, kept across read chunks so prompt/state
+        # detection sees whole lines - the read loop drains in_waiting, so a
+        # prompt typically arrives in several small pieces.
+        self._rx_linebuf = ""
 
         # Bumped by reconfigure() each time it swaps in a freshly opened
         # _ser. _read_loop compares against this to tell "port was closed
@@ -1055,6 +1082,8 @@ class SerialLink:
         with open(src, "wb") as f:
             f.write(payload)
         back = src + ".back"
+        # upload()/download() take inline content now, not host paths.
+        encoded = base64.b64encode(payload).decode("ascii")
 
         original = self.xmodem_pacing
         attempts = []
@@ -1066,16 +1095,17 @@ class SerialLink:
                 # dominated by fixed costs - XM startup, the handshake poke wait,
                 # the mode-switch settles - which mask the difference between
                 # pacing settings and understate the real gain.
-                started = time.time()
-                up = self.upload(src, dest_drive=drive, cpm_name="PACETEST.BIN", verify=False)
-                send_seconds = time.time() - started
+                started = time.perf_counter()
+                up = self.upload("PACETEST.BIN", drive, content=encoded,
+                                 binary=True, overwrite=True)
+                send_seconds = time.perf_counter() - started
                 if not up.get("ok"):
                     attempts.append({"chunk": chunk, "delay": delay, "ok": False,
                                      "error": up.get("error", "upload failed")})
                     logger.info("Pacing %s/%.3fs failed on upload: %s", chunk, delay, up.get("error"))
                     break
 
-                down = self.download(f"{drive}PACETEST.BIN", local_path=back)
+                down = self.download("PACETEST.BIN", drive, binary=True)
                 matched = down.get("ok") and down.get("sha256") == expected
                 attempts.append({"chunk": chunk, "delay": delay, "ok": bool(matched),
                                  "send_seconds": round(send_seconds, 1),
@@ -1089,7 +1119,7 @@ class SerialLink:
                             chunk, delay, send_seconds, test_bytes)
         finally:
             self.xmodem_pacing = best or original
-            self.run_command(f"ERA {drive}PACETEST.BIN", timeout=DIR_TIMEOUT)
+            self._erase(f"{drive}PACETEST.BIN")
             for path in (src, back):
                 if os.path.exists(path):
                     os.unlink(path)
@@ -1241,6 +1271,30 @@ class SerialLink:
                         "its power-on rate) - falling back to %d baud", self.baud, self._default_baud)
         self.reconfigure(baud=self._default_baud, is_default_change=False)
 
+    def _set_prompt_state(self, line_s: str):
+        """Classify a prompt line into _system_state/_last_prompt.
+
+        ZPM3 prompts carry a clock prefix ("15:21 J1>") or a named
+        directory ("A0:SYSTEM>"); plain CP/M prompts are just "A>"."""
+        if CPM_STATE_RE.search(line_s):
+            if self._system_state != "cpm":
+                logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
+            self._system_state = "cpm"
+            self._last_prompt = line_s
+            if re.search(r"\d{1,2}:\d{2}", line_s) or \
+                    re.search(r"[A-P][0-9]*:[A-Za-z0-9]+>", line_s):
+                self._zpm3 = True
+        elif HBIOS_PROMPT_RE.search(line_s):
+            if self._system_state != "hbios":
+                logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
+            self._system_state = "hbios"
+            self._last_prompt = line_s
+        elif FLASH_PROMPT_RE.search(line_s):
+            if self._system_state != "flash_util":
+                logger.info("Detected RC2014 system state: FLASH_UTIL (prompt: %r)", line_s)
+            self._system_state = "flash_util"
+            self._last_prompt = line_s
+
     def _update_system_state(self, text: str):
         self._check_for_baud_mismatch(text)
 
@@ -1267,27 +1321,29 @@ class SerialLink:
                 self.hardware_info.update({k: v for k, v in parsed_z.items() if v})
                 self._save_hardware_info()
 
-        for line in text.splitlines():
+        buf = self._rx_linebuf + text
+        lines = buf.split("\n")
+        # The tail after the last newline is an incomplete line - hold it for
+        # the next chunk. A freshly printed prompt sits exactly there, with no
+        # newline ever coming after it, so check it against the strict
+        # prompt-only patterns below.
+        self._rx_linebuf = lines.pop()
+        for line in lines:
             line_s = line.strip()
             if not line_s:
                 continue
             if CPM_STATE_RE.search(line_s):
-                if self._system_state != "cpm":
-                    logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
-                self._system_state = "cpm"
-                self._last_prompt = line_s
+                self._set_prompt_state(line_s)
             elif HBIOS_PROMPT_RE.search(line_s):
-                if self._system_state != "hbios":
-                    logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
-                self._system_state = "hbios"
-                self._last_prompt = line_s
+                self._set_prompt_state(line_s)
             elif FLASH_PROMPT_RE.search(line_s):
-                if self._system_state != "flash_util":
-                    logger.info("Detected RC2014 system state: FLASH_UTIL (prompt: %r)", line_s)
-                self._system_state = "flash_util"
-                self._last_prompt = line_s
+                self._set_prompt_state(line_s)
             elif re.search(r"([A-Za-z0-9_-]+[:>])", line_s):
                 self._last_prompt = line_s
+
+        tail_s = self._rx_linebuf.strip()
+        if tail_s and PROMPT_ONLY_RE.search(tail_s):
+            self._set_prompt_state(tail_s)
 
         # Checked against the accumulated boot buffer, not text.splitlines()
         # above - the RC2014 echoes typed input one character (or a small
@@ -1372,7 +1428,11 @@ class SerialLink:
                 time.sleep(0.2)
                 continue
             try:
-                data = ser.read(4096)
+                # Drain whatever the OS buffer already holds; block (briefly)
+                # for 1 byte when empty. read(4096) alone would accumulate
+                # until the timeout expires, delivering output in visible
+                # 100ms lumps instead of a smooth stream.
+                data = ser.read(ser.in_waiting or 1)
             except Exception as e:
                 # pyserial's read() isn't atomic about a concurrent close():
                 # depending on timing it raises SerialException, OSError, or
@@ -1524,7 +1584,14 @@ class SerialLink:
         elif append_enter and not text.endswith("\r"):
             text += "\r"
         data = text.encode("latin-1")
-        if len(data) > 1:
+        if data.startswith(b"\x1b"):
+            # Escape sequences (cursor keys, function keys) must arrive
+            # atomically: programs poll for the byte after ESC with a short
+            # timeout to tell a sequence from a lone ESC keypress, and the
+            # inter-byte gap of paced writes makes them misread as ESC.
+            # 3-6 byte bursts are far below any UART overrun threshold.
+            self._write_raw(data)
+        elif len(data) > 1:
             self._write_paced(data, *self.text_pacing)
         else:
             self._write_raw(data)
@@ -1548,7 +1615,10 @@ class SerialLink:
                 time.sleep(value)
                 continue
             sent.extend(value)
-            if len(value) > 1:
+            if value.startswith(b"\x1b"):
+                # Escape sequences must be atomic; see send_text().
+                self._write_raw(value)
+            elif len(value) > 1:
                 self._write_paced(value, *self.text_pacing)
             else:
                 self._write_raw(value)
@@ -1628,6 +1698,12 @@ class SerialLink:
                 "connected": self._ser.is_open,
                 "rx_active": rx_active, "tx_active": tx_active,
                 "system_state": self._system_state, "last_prompt": self._last_prompt,
+                # Which CP/M-flavored OS is up: ZPM3 from its prompt shape,
+                # ZSDOS from its boot banner, else plain CP/M.
+                "os": ("zpm3" if self._zpm3
+                       else "zsdos" if self.hardware_info.get("zsdos_version")
+                       else "cpm" if self._system_state == "cpm"
+                       else ""),
                 "current_op": self._current_op,
                 "xmodem_progress": dict(self._xmodem_progress)}
 
@@ -2123,9 +2199,30 @@ class SerialLink:
             logger.warning("XM banner not recognised; proceeding on handshake. Saw: %r", text[-200:])
         return {"ok": True, "armed": res["matched"]}
 
+    def _dir_command(self, target: str) -> str:
+        # ZPM3 cannot DIR user areas (e.g. J1:) - SDZ is its listing command.
+        return f"{'SDZ' if self._zpm3 else 'DIR'} {target}"
+
+    def _erase(self, target: str) -> None:
+        # ZPM3 (CP/M+ ZCPR) delete is ERASE (ERA does not exist) and it
+        # only takes a bare filename - switch to the target drive:user first.
+        if self._zpm3:
+            if ":" in target:
+                du, bare = target.split(":", 1)
+                self.run_command(f"{du}:", timeout=DIR_TIMEOUT)
+                self.run_command(f"ERASE {bare}", timeout=DIR_TIMEOUT)
+            else:
+                self.run_command(f"ERASE {target}", timeout=DIR_TIMEOUT)
+        else:
+            self.run_command(f"ERA {target}", timeout=DIR_TIMEOUT)
+
     def _file_exists(self, target: str) -> bool:
-        listing = self.run_command(f"DIR {target}", timeout=DIR_TIMEOUT)
+        listing = self.run_command(self._dir_command(target), timeout=DIR_TIMEOUT)
         output = (listing.get("output") or "").upper()
+        if "ILLEGAL COMMAND TAIL" in output or "UNRECOGNIZED" in output:
+            # Fallback in case ZPM3 was not detected from the prompt.
+            listing = self.run_command(f"SDZ {target}", timeout=DIR_TIMEOUT)
+            output = (listing.get("output") or "").upper()
         stem = target.split(":")[-1].split(".")[0].upper()
         return "NO FILE" not in output and bool(stem) and stem in output
 
@@ -2151,7 +2248,8 @@ class SerialLink:
 
         RomWBW's UNZIP refuses to overwrite an existing file (reports
         "EXISTS" and skips it - confirmed against real hardware) just like
-        XM does, so overwrite=True erases the existing target first.
+        XM does, so overwrite=True erases the existing target first. On ZPM3
+        the unzipper is UNZIPZ, which only CRC-checks unless given /E.
         """
         if self._system_state != "cpm":
             return {"ok": False, "error": f"system is not at a CP/M prompt "
@@ -2179,6 +2277,10 @@ class SerialLink:
 
         stat = self.run_command(f"STAT {drive}:", timeout=DIR_TIMEOUT)
         free = _parse_stat_free_space(stat.get("output", ""))
+        if free is None and self._zpm3:
+            # ZPM3's STAT has no drive-space form; SDZ reports it instead.
+            sdz = self.run_command(f"SDZ {drive}:", timeout=DIR_TIMEOUT)
+            free = _parse_sdz_free_space(sdz.get("output", ""))
         needed = len(zip_bytes) + len(raw)  # zip and its extracted copy briefly coexist
         if free is not None and free < needed:
             return {"ok": False, "target": target, "error": "insufficient space",
@@ -2186,6 +2288,14 @@ class SerialLink:
 
         stem = name.split(".")[0]
         zip_target = f"{drive}:{stem}.ZIP"
+
+        # XM refuses to overwrite, so a staging zip left behind by an
+        # interrupted upload would poison every retry - clear it first.
+        # No post-erase re-check here: if the erase failed, XM's own
+        # "File exists" refusal comes back from _arm_xm() as the error.
+        if self._file_exists(zip_target):
+            logger.info("%s exists from a previous upload; erasing it", zip_target)
+            self._erase(zip_target)
 
         tmp_path = None
         try:
@@ -2207,11 +2317,19 @@ class SerialLink:
         if exists:
             # UNZIP won't replace an existing file (see docstring); erase it
             # first, same as the old XM-direct path had to.
-            self.run_command(f"ERA {target}", timeout=DIR_TIMEOUT)
+            self._erase(target)
+            if self._file_exists(target):
+                return {"ok": False, "target": target,
+                        "error": f"could not erase existing {target} (read-only drive?)"}
 
-        self.run_command(f"UNZIP {zip_target} {_format_target(drive, user, '')}",
-                         timeout=DIR_TIMEOUT)
-        self.run_command(f"ERA {zip_target}", timeout=DIR_TIMEOUT)
+        # ZPM3 ships UNZIPZ, which only CRC-checks an archive unless told
+        # otherwise - /E is what actually extracts (confirmed live: bare
+        # "UNZIP B:X.ZIP B:" printed "Checking..." and created nothing).
+        unzip_cmd = f"UNZIP {zip_target} {_format_target(drive, user, '')}"
+        if self._zpm3:
+            unzip_cmd += " /E"
+        self.run_command(unzip_cmd, timeout=DIR_TIMEOUT)
+        self._erase(zip_target)
 
         verified = self._file_exists(target)
         return {

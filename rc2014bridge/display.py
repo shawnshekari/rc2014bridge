@@ -27,9 +27,10 @@ from pygame._sdl2.video import Renderer, Texture, Window
 from rc2014bridge import config as bridge_config
 from rc2014bridge.link import list_serial_ports, probe_serial_connection
 
-FG = (110, 255, 110)
+FG = (229, 229, 229)
+FG_BOLD = (255, 255, 255)   # bold default-color text: bright white (industry convention)
 BG = (10, 12, 10)
-CURSOR = (110, 255, 110)
+CURSOR = (192, 192, 192)
 FONT_SIZE = 18
 CURSOR_BLINK_MS = 500
 
@@ -64,8 +65,10 @@ STANDARD_TO_BRIGHT = {
 }
 
 
-def _resolve_color(color_val: str, default_rgb: tuple[int, int, int], is_bold: bool = False) -> tuple[int, int, int]:
+def _resolve_color(color_val: str, default_rgb: tuple[int, int, int], is_bold: bool = False, bold_default_rgb: tuple[int, int, int] | None = None) -> tuple[int, int, int]:
     if color_val == "default":
+        if is_bold and bold_default_rgb is not None:
+            return bold_default_rgb
         return default_rgb
     color_name = color_val
     if is_bold and color_name in STANDARD_TO_BRIGHT:
@@ -129,8 +132,19 @@ def _allowed_during_transfer(data: bytes) -> bool:
 def _key_to_bytes(event) -> bytes:
     if event.key in SPECIAL_KEYS:
         return SPECIAL_KEYS[event.key]
-    if event.mod & pygame.KMOD_CTRL and pygame.K_a <= event.key <= pygame.K_z:
-        return bytes([event.key - pygame.K_a + 1])  # Ctrl-A..Ctrl-Z -> 0x01..0x1A
+    if event.mod & pygame.KMOD_CTRL:
+        if pygame.K_a <= event.key <= pygame.K_z:
+            return bytes([event.key - pygame.K_a + 1])  # Ctrl-A..Ctrl-Z -> 0x01..0x1A
+        ctrl_punct = {  # Ctrl with punctuation -> 0x1B..0x1F (US layout)
+            pygame.K_LEFTBRACKET: 0x1B,   # Ctrl-[
+            pygame.K_BACKSLASH: 0x1C,     # Ctrl-\
+            pygame.K_RIGHTBRACKET: 0x1D,  # Ctrl-]  (MSX8 game quit hotkey)
+            pygame.K_6: 0x1E,             # Ctrl-^
+            pygame.K_MINUS: 0x1F,         # Ctrl-_
+        }
+        if event.key in ctrl_punct:
+            return bytes([ctrl_punct[event.key]])
+        return b""
     if event.unicode:
         try:
             return event.unicode.encode("latin-1")
@@ -141,6 +155,7 @@ def _key_to_bytes(event) -> bytes:
 
 TOP_MENU_HEIGHT = 32
 STATUS_BAR_HEIGHT = 32
+SCROLLBAR_W = 14
 
 # Presets offered in the Settings screen's baud dropdown. Standard rates a
 # RC2014 UART (Z80 SIO/ACIA or 16550-alike) can plausibly be run at; any
@@ -471,14 +486,66 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
     menu_font = pygame.font.SysFont("monospace", 16, bold=True)
     status_font = pygame.font.SysFont("monospace", 16, bold=True)
     cell_w, cell_h = font.size("M")
-    screen_w = link.cols * cell_w
+    term_w = link.cols * cell_w
+    screen_w = term_w + SCROLLBAR_W
     term_h = link.rows * cell_h
     term_y = TOP_MENU_HEIGHT
     screen_h = TOP_MENU_HEIGHT + term_h + STATUS_BAR_HEIGHT
     surface = pygame.display.set_mode((screen_w, screen_h))
+    pygame.scrap.init()  # needs the window to exist (Windows scrap is window-bound)
+    pygame.key.set_repeat(500, 33)  # Tera Term-style autorepeat: 500ms delay, ~30/s
     clock = pygame.time.Clock()
 
     scroll_offset = 0
+    sb_history = 0      # scrollback lines available, synced from get_screen()
+    sb_offset = 0       # clamped scroll offset, synced from get_screen()
+    scrollbar_drag = False
+    drag_grab_dy = 0
+    sel_anchor = None       # (col,row) where the current selection drag began
+    sel_cells = None        # normalized ((c0,r0),(c1,r1)) of the selection
+    sel_dragging = False
+    last_lines = []         # lines currently on display, for copy extraction
+
+    def _cell_at(mx, my):
+        c = min(max(mx, 0) // cell_w, link.cols - 1)
+        r = min(max(my - term_y, 0) // cell_h, link.rows - 1)
+        return c, r
+
+    def _sel_normalize(a, b):
+        return (b, a) if (b[1], b[0]) < (a[1], a[0]) else (a, b)
+
+    def _selection_text():
+        if not sel_cells:
+            return ""
+        (c0, r0), (c1, r1) = sel_cells
+        out = []
+        for r in range(r0, r1 + 1):
+            if r >= len(last_lines):
+                break
+            line = last_lines[r]
+            a = c0 if r == r0 else 0
+            b = c1 + 1 if r == r1 else link.cols
+            out.append(line[a:b].rstrip())
+        return "\r\n".join(out)
+
+    def _paste_clipboard():
+        clip = pygame.scrap.get(pygame.SCRAP_TEXT)
+        if not clip:
+            return
+        text = clip.decode("utf-8", "replace").replace("\x00", "")
+        text = text.replace("\r\n", "\r").replace("\n", "\r")
+        if text:
+            link.send_text(text, append_enter=False)
+
+    def _sb_thumb_rect():
+        """Scrollbar thumb rect for the current sb_offset/sb_history, or None."""
+        if sb_history <= 0:
+            return None
+        frac = link.rows / (link.rows + sb_history)
+        thumb_h = max(20, int(term_h * frac))
+        pos = 1.0 - (sb_offset / sb_history)
+        thumb_y = term_y + int(pos * (term_h - thumb_h))
+        return pygame.Rect(term_w, thumb_y, SCROLLBAR_W, thumb_h)
     prompt_mode = None  # None, "SEND", "RECEIVE"
     prompt_text = ""
     show_reboot_modal = False
@@ -674,6 +741,28 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     scroll_offset += 3 * event.y
                 elif event.y < 0:
                     scroll_offset = max(0, scroll_offset + 3 * event.y)
+            elif event.type == pygame.MOUSEMOTION:
+                if scrollbar_drag and sb_history > 0:
+                    frac = link.rows / (link.rows + sb_history)
+                    thumb_h = max(20, int(term_h * frac))
+                    travel = term_h - thumb_h
+                    if travel > 0:
+                        pos = (event.pos[1] - term_y - drag_grab_dy) / travel
+                        pos = min(1.0, max(0.0, pos))
+                        scroll_offset = int(round((1.0 - pos) * sb_history))
+                if sel_dragging:
+                    sel_cells = _sel_normalize(sel_anchor, _cell_at(*event.pos))
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                scrollbar_drag = False
+                if sel_dragging:
+                    sel_dragging = False
+                    if sel_cells and sel_cells[0] != sel_cells[1]:
+                        # Tera Term style: the selection alone copies to the clipboard
+                        text = _selection_text()
+                        if text:
+                            pygame.scrap.put(pygame.SCRAP_TEXT, text.encode("utf-8"))
+                    else:
+                        sel_cells = None  # plain click clears the selection
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if show_hw_info_modal:
@@ -724,6 +813,18 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         show_settings_modal = False
                     continue
 
+                if mx >= term_w and term_y <= my < term_y + term_h:
+                    thumb = _sb_thumb_rect()
+                    if thumb is not None and thumb.collidepoint(mx, my):
+                        scrollbar_drag = True
+                        drag_grab_dy = my - thumb.top
+                    elif sb_history > 0:
+                        if thumb is not None and my < thumb.top:
+                            scroll_offset = min(sb_history, scroll_offset + link.rows)
+                        else:
+                            scroll_offset = max(0, scroll_offset - link.rows)
+                    continue
+
                 clicked_menu_item = False
                 if active_menu_idx is not None:
                     top_x = 8
@@ -754,7 +855,17 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                                 break
                             top_x += header_w + 4
                     else:
-                        active_menu_idx = None
+                        if active_menu_idx is not None:
+                            active_menu_idx = None  # click only dismisses the menu
+                        elif term_y <= my < term_y + term_h and mx < term_w:
+                            sel_anchor = _cell_at(mx, my)
+                            sel_cells = None
+                            sel_dragging = True
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                mx, my = event.pos
+                if (my >= term_y and not show_hw_info_modal and not show_reboot_modal
+                        and prompt_mode is None):
+                    _paste_clipboard()
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 4:  # Wheel up
                     scroll_offset += 3
@@ -825,6 +936,9 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     continue
 
                 if event.mod & pygame.KMOD_SHIFT:
+                    if event.key == pygame.K_INSERT:
+                        _paste_clipboard()
+                        continue
                     if event.key == pygame.K_PAGEUP:
                         scroll_offset += 10
                         continue
@@ -882,6 +996,9 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
 
         state = link.get_screen(scroll_offset=scroll_offset)
         scroll_offset = state.get("scroll_offset", 0)
+        sb_history = state.get("history_count", 0)
+        sb_offset = state.get("scroll_offset", 0)
+        last_lines = state.get("lines", [])
         surface.fill(BG)
 
         # The banner arrives after startup, so the machine's identity only
@@ -934,7 +1051,7 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         reverse = run_data.get("reverse", False)
                         underscore = run_data.get("underscore", False)
 
-                        fg_rgb = _resolve_color(fg_val, FG, is_bold=bold)
+                        fg_rgb = _resolve_color(fg_val, FG, is_bold=bold, bold_default_rgb=FG_BOLD)
                         bg_rgb = _resolve_color(bg_val, BG)
 
                         if reverse:
@@ -956,16 +1073,29 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         img = font.render(line, False, FG, BG)
                         surface.blit(img, (0, term_y + row * cell_h))
 
+            # Selection highlight (drawn over the text, under the cursor)
+            if sel_cells:
+                (c0, r0), (c1, r1) = sel_cells
+                overlay = pygame.Surface((term_w, term_h), pygame.SRCALPHA)
+                for r in range(r0, r1 + 1):
+                    a = c0 if r == r0 else 0
+                    b = c1 if r == r1 else link.cols - 1
+                    overlay.fill((255, 255, 255, 60),
+                                 (a * cell_w, r * cell_h, (b - a + 1) * cell_w, cell_h))
+                surface.blit(overlay, (0, term_y))
+
             if scroll_offset == 0 and (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
                 cx, cy = state["cursor"]["x"], state["cursor"]["y"]
                 rect = pygame.Rect(cx * cell_w, term_y + cy * cell_h, cell_w, cell_h)
                 pygame.draw.rect(surface, CURSOR, rect, width=2)
 
-        if scroll_offset > 0:
-            badge_text = f" SCROLLBACK: -{scroll_offset} lines (Shift+End to exit) "
-            badge_img = font.render(badge_text, True, (255, 255, 255), (140, 30, 30))
-            badge_rect = badge_img.get_rect(topright=(screen_w - 5, term_y + 5))
-            surface.blit(badge_img, badge_rect)
+        # Scrollbar: always a dim track on the right edge of the terminal;
+        # a thumb appears once there is scrollback to move through.
+        pygame.draw.rect(surface, (22, 26, 24), (term_w, term_y, SCROLLBAR_W, term_h))
+        thumb = _sb_thumb_rect()
+        if thumb is not None:
+            thumb_color = (150, 170, 150) if scrollbar_drag else (95, 115, 95)
+            pygame.draw.rect(surface, thumb_color, thumb.inflate(-2, 0), border_radius=4)
 
         # --------------------------------------------------------------
         # 2. Render Top Menu Header Bar
@@ -1251,7 +1381,11 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             badge_bg = (30, 110, 180)
             badge_fg = (210, 240, 255)
         elif sys_env == "CPM":
-            mode_label = "CPM/ZSDOS"
+            # Report the actual OS flavor, not just the family: ZPM3 speaks a
+            # different command dialect (SDZ/ERASE/UNZIPZ /E), and seeing which
+            # one is up explains which commands will work.
+            os_flavor = state.get("os", "")
+            mode_label = {"zpm3": "ZPM3", "zsdos": "CPM/ZSDOS"}.get(os_flavor, "CPM")
             badge_bg = (24, 85, 45)
             badge_fg = (140, 255, 170)
         elif sys_env == "HBIOS":
@@ -1330,7 +1464,7 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         center=(pbar_x + pbar_w // 2, status_y + STATUS_BAR_HEIGHT // 2)))
 
         pygame.display.flip()
-        clock.tick(30)
+        clock.tick(60)
 
     for pw in pixel_windows:
         pw.destroy()

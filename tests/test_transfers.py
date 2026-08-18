@@ -254,6 +254,79 @@ class TestUpload(TransferTestCase):
                          "the zip staging file must be cleaned up")
 
 
+class TestUploadZpm3(TransferTestCase):
+    """ZPM3 (ZCPR/CP/M+) speaks a different dialect: SDZ instead of DIR (DIR
+    can't address user areas), ERASE instead of ERA, STAT has no drive-space
+    form (SDZ's 'Free: Nk' trailer is the source), and its UNZIPZ only
+    CRC-checks an archive unless given /E - all confirmed live on an SC126
+    running ZPM3."""
+
+    def setUp(self):
+        super().setUp()
+        self.link._zpm3 = True
+
+    def _responder_for(self, exists_before: bool = False):
+        files = {"LEDSHOW.COM"} if exists_before else set()
+        zpm3_prompt = b"\r\n15:45 B0>"
+
+        def _responder(line: bytes):
+            self.commands.append(line)
+            cmd = line.decode("latin-1").strip().upper()
+            if cmd.startswith("SDZ"):
+                # "SDZ B:" (free-space probe) or "SDZ B:LEDSHOW.COM"
+                stem = cmd.split(":")[-1].replace(".", "").strip()
+                if stem and stem not in {f.replace(".", "") for f in files}:
+                    return b"\r\n >> No detectable file(s) on B0:   Free: 4000k \r\n" + zpm3_prompt
+                listing = b"".join(b"\r\nB0: " + f.encode() for f in files)
+                return listing + b"\r\nFree: 4000k\r\n" + zpm3_prompt
+            if cmd.startswith("STAT"):
+                return b"\r\nSTAT ?\r\n" + zpm3_prompt  # ZPM3 STAT has no space form
+            if cmd.startswith("ERASE"):
+                fname = cmd.split(None, 1)[1]
+                files.discard(fname)
+                return zpm3_prompt
+            if "XM R" in cmd:
+                return b"\r\nReceiving: B0:LEDSHOW.ZIP\r\nTo cancel: Ctrl-X\r\n"
+            if cmd.startswith("UNZIP"):
+                if "/E" not in cmd:
+                    # UNZIPZ's default is a CRC check - nothing is extracted.
+                    return b"\r\nChecking...\r\nDone.\r\n" + zpm3_prompt
+                files.add("LEDSHOW.COM")
+                return b"\r\nExtracting\r\n" + zpm3_prompt
+            return zpm3_prompt
+
+        self.fake.responder = _responder
+
+    def test_upload_uses_the_zpm3_dialect(self):
+        self._responder_for(exists_before=False)
+        res = self.link.upload("LEDSHOW.COM", "B", content="x")
+
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["verified"])
+        commands = self.command_text()
+        self.assertIn("UNZIP B:LEDSHOW.ZIP B: /E", commands)
+        self.assertTrue(any(c.startswith("SDZ") for c in commands))
+        self.assertFalse(any(c.startswith("DIR ") for c in commands))
+        self.assertFalse(any(c.startswith("ERA ") for c in commands))
+
+    def test_overwrite_erases_with_bare_filename_after_drive_switch(self):
+        self._responder_for(exists_before=True)
+        res = self.link.upload("LEDSHOW.COM", "B", content="x", overwrite=True)
+
+        self.assertTrue(res["ok"], res)
+        commands = self.command_text()
+        self.assertIn("ERASE LEDSHOW.COM", commands)
+        erase_index = commands.index("ERASE LEDSHOW.COM")
+        unzip_index = next(i for i, c in enumerate(commands) if c.startswith("UNZIP"))
+        self.assertLess(erase_index, unzip_index, "must erase the old target before UNZIP")
+
+    def test_free_space_comes_from_sdz_when_stat_has_no_space_form(self):
+        self._responder_for()
+        res = self.link.upload("LEDSHOW.COM", "B", content="x")
+        self.assertTrue(res["ok"], res)
+        self.assertIn("SDZ B:", self.command_text())
+
+
 class TestDownload(TransferTestCase):
     def test_arms_xm_with_1k_blocks_receives_and_hashes(self):
         self.respond({b"XM SK": b"\r\nSending: LEDSHOW.COM\r\nTo cancel: Ctrl-X\r\n",

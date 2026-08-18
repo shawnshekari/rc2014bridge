@@ -81,5 +81,43 @@ class TestGetScreenMaxLines(unittest.TestCase):
         self.assertEqual(newest[0], "Line 42")
 
 
+class TestGetScreenOsField(unittest.TestCase):
+    """The status bar reports the actual OS flavor via get_screen()["os"]:
+    ZPM3 from its prompt shape, ZSDOS from the boot banner, else plain CP/M."""
+
+    def _link(self):
+        hw_info = os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "hardware_info.json")
+        with patch("serial.Serial") as mock_serial:
+            mock_serial.return_value.is_open = True
+            mock_serial.return_value.read.return_value = b""
+            link = SerialLink(port="/dev/fake", baud=115200, hw_info_file=hw_info)
+        self.addCleanup(link.close)
+        return link
+
+    def test_zpm3_prompt_reports_zpm3(self):
+        link = self._link()
+        # fragmented across reads, as the real ZPM3 console delivers it
+        link._update_system_state("\r\n\x1b[1m15:45")
+        link._update_system_state("\x1b[m A0:SYSTEM\x1b[1m\x1b[m>")
+        state = link.get_screen()
+        self.assertEqual(state["system_state"], "cpm")
+        self.assertEqual(state["os"], "zpm3")
+
+    def test_zsdos_banner_reports_zsdos(self):
+        link = self._link()
+        link.hardware_info["zsdos_version"] = "ZSDOS 1.1"
+        link._update_system_state("A>")
+        self.assertEqual(link.get_screen()["os"], "zsdos")
+
+    def test_plain_cpm_reports_cpm(self):
+        link = self._link()
+        link._update_system_state("A>")
+        self.assertEqual(link.get_screen()["os"], "cpm")
+
+    def test_no_os_before_cpm(self):
+        link = self._link()
+        self.assertEqual(link.get_screen()["os"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
