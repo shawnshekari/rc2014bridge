@@ -32,7 +32,9 @@ for cand in .venv/Scripts/python.exe .venv/bin/python \
             "${RC2014_VENV:-}/Scripts/python.exe" "${RC2014_VENV:-}/bin/python"; do
   [ -n "$cand" ] && [ -x "$cand" ] && { PY="$cand"; break; }
 done
-[ -z "$PY" ] && PY=$(command -v python3 || command -v python) || {
-  echo "bridge: no python found (set RC2014_VENV to your venv)" >&2; exit 1; }
+if [ -z "$PY" ]; then
+  PY=$(command -v python3 || command -v python) || {
+    echo "bridge: no python found (set RC2014_VENV to your venv)" >&2; exit 1; }
+fi
 
 exec "$PY" -m rc2014bridge.app --port "$PORT" --baud "$BAUD" --mcp-host 127.0.0.1 "$@"
