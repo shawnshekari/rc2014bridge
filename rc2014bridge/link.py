@@ -693,6 +693,11 @@ class SerialLink:
                  text_pacing: tuple[int, float] = None,
                  xmodem_pacing: tuple[int, float] = None,
                  rtscts: bool = False):
+        # Windows accepts COMn in any case but enumerates it uppercase;
+        # normalize so the status bar/dropdown don't show "com10" and
+        # case-mismatched port strings never reach the same-port checks.
+        if os.name == "nt" and re.fullmatch(r"(?i)com\d+", port):
+            port = port.upper()
         self.port = port
         self.baud = baud
         # The board's "resting" rate - what --baud/the config file say it

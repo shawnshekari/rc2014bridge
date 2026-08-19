@@ -37,6 +37,17 @@ def _constructing_serial():
 
 
 class TestReconfigure(unittest.TestCase):
+    def test_windows_port_name_is_normalized_uppercase(self):
+        # "com10" from the config file / CLI used to leak into the status
+        # bar and the settings dropdown as-is; on Windows it's normalized
+        # to the enumerated spelling.
+        with patch("os.name", "nt"), patch("serial.Serial") as mock_serial:
+            mock_serial.return_value.is_open = True
+            mock_serial.return_value.read.return_value = b""
+            link = SerialLink("com10", hw_info_file=_hw_path())
+            self.addCleanup(link.close)
+        self.assertEqual(link.port, "COM10")
+
     def test_reconfigure_updates_port_baud_rtscts_and_swaps_ser(self):
         link, fake1 = _link(baud=115200)
         self.addCleanup(link.close)
