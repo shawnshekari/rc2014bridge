@@ -1378,6 +1378,17 @@ class SerialLink:
         self._reader.join(timeout=1.0)
         self._ser.close()
 
+    def resize_terminal(self, cols: int, rows: int):
+        """Re-grid the virtual terminal to match a resized GUI window. Font
+        and cell size stay fixed - a smaller window simply shows fewer
+        columns/rows. pyte clips at the top/right when shrinking (no reflow,
+        matching how xterm treats full-screen apps)."""
+        with self._screen_lock:
+            if cols == self.cols and rows == self.rows:
+                return
+            self.cols, self.rows = cols, rows
+            self._screen.resize(lines=rows, columns=cols)
+
     def _check_for_baud_mismatch(self, text: str):
         """Recover from the board resetting (reset button, REBOOT, a crashed
         program) while the bridge is still at a baud it only got to via

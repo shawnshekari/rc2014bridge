@@ -119,5 +119,42 @@ class TestGetScreenOsField(unittest.TestCase):
         self.assertEqual(link.get_screen()["os"], "")
 
 
+class TestResizeTerminal(unittest.TestCase):
+    """The GUI re-grids the terminal when its window is resized (fixed font,
+    fewer/more columns and rows), via SerialLink.resize_terminal()."""
+
+    def _link(self):
+        hw_info = os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "hardware_info.json")
+        with patch("serial.Serial") as mock_serial:
+            mock_serial.return_value.is_open = True
+            mock_serial.return_value.read.return_value = b""
+            link = SerialLink(port="/dev/fake", baud=115200, hw_info_file=hw_info)
+        self.addCleanup(link.close)
+        return link
+
+    def test_resize_regrids_and_keeps_content(self):
+        link = self._link()
+        self.assertEqual((link.cols, link.rows), (80, 48))
+        with link._screen_lock:
+            link._stream.feed("hello terminal\r\n")
+
+        link.resize_terminal(132, 50)
+        self.assertEqual((link.cols, link.rows), (132, 50))
+        state = link.get_screen()
+        self.assertEqual((state["cols"], state["rows"]), (132, 50))
+        self.assertEqual(len(state["lines"]), 50)
+        self.assertTrue(any("hello terminal" in l for l in state["lines"]))
+
+        link.resize_terminal(80, 24)
+        self.assertEqual((link.cols, link.rows), (80, 24))
+        self.assertEqual(len(link.get_screen()["lines"]), 24)
+
+    def test_resize_same_size_is_a_noop(self):
+        link = self._link()
+        screen_before = link._screen
+        link.resize_terminal(80, 48)
+        self.assertIs(link._screen, screen_before)
+
+
 if __name__ == "__main__":
     unittest.main()
