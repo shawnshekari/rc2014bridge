@@ -1281,7 +1281,9 @@ class SerialLink:
         Windows refuses a second open of the same COM port
         (PermissionError 13), so the independent probe_serial_connection()
         would always fail against our own port there."""
-        if port == self.port and self._ser.is_open:
+        # normcase: Windows reports enumerated ports uppercase while the
+        # config file may say "com10" - the same physical port either way.
+        if os.path.normcase(port) == os.path.normcase(self.port) and self._ser.is_open:
             return {"ok": True, "already_connected": True}
         return probe_serial_connection(port, baud, rtscts)
 
@@ -1304,24 +1306,56 @@ class SerialLink:
         new_port = self.port if port is None else port
         new_baud = self.baud if baud is None else baud
         new_rtscts = self._ser.rtscts if rtscts is None else rtscts
-        if new_port == self.port and self._ser.is_open:
+        # normcase: Windows enumerates ports uppercase ("COM10") while the
+        # config file may say "com10" - a case-sensitive comparison here
+        # skipped the close and the reopen then failed with PermissionError
+        # 13 (a second open of a port we already hold), leaving the old
+        # connection running and the user thinking the change was applied.
+        same_port = os.path.normcase(new_port) == os.path.normcase(self.port)
+        closed_ser = None
+        if same_port and self._ser.is_open:
             # Same-port reconfigure (e.g. only baud/RTS-CTS changed): Windows
             # refuses a second open of a port we already hold
             # (PermissionError 13, "Access is denied"), so close before
             # reopening. Swap in a placeholder first so the read loop parks
             # on is_open=False instead of reading a closing port.
             with self._write_lock:
-                old_ser = self._ser
+                closed_ser = self._ser
                 self._reinit_epoch += 1
                 self._ser = _DisconnectedSerial(new_port, baudrate=new_baud, rtscts=new_rtscts)
-            old_ser.close()
-        try:
-            new_ser = serial.Serial(new_port, baudrate=new_baud, bytesize=8, parity="N",
-                                     stopbits=1, timeout=0.02, rtscts=new_rtscts)
-        except (serial.SerialException, OSError) as e:
+            closed_ser.close()
+        # After a same-port close, Windows can report the port as busy for a
+        # few ms (the serial driver only releases the device once the reader
+        # thread's cancelled read completes), so retry the open a few times
+        # before giving up.
+        new_ser = None
+        last_err = None
+        for _ in range(5):
+            try:
+                new_ser = serial.Serial(new_port, baudrate=new_baud, bytesize=8, parity="N",
+                                        stopbits=1, timeout=0.02, rtscts=new_rtscts)
+                break
+            except (serial.SerialException, OSError) as e:
+                last_err = e
+                time.sleep(0.1)
+        if new_ser is None:
             logger.warning("reconfigure(port=%r, baud=%r, rtscts=%r) failed: %s",
-                           new_port, new_baud, new_rtscts, e)
-            return {"ok": False, "error": str(e)}
+                           new_port, new_baud, new_rtscts, last_err)
+            if closed_ser is not None:
+                # We already closed the previous connection - don't leave the
+                # link dead, try to restore it with its original settings.
+                try:
+                    restored = serial.Serial(self.port, baudrate=self.baud, bytesize=8,
+                                           parity="N", stopbits=1, timeout=0.02,
+                                           rtscts=closed_ser.rtscts)
+                    with self._write_lock:
+                        self._reinit_epoch += 1
+                        self._ser = restored
+                    logger.info("Reconfigure failed but the previous connection was restored")
+                except (serial.SerialException, OSError):
+                    logger.warning("Could not restore the previous connection either",
+                                   exc_info=True)
+            return {"ok": False, "error": str(last_err)}
 
         # Swap under _write_lock so an in-flight _write_raw()/_write_paced()
         # (which read self._ser under the same lock) can't observe a

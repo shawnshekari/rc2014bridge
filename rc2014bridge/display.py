@@ -713,7 +713,15 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             settings_baud = link.baud
             settings_rtscts = getattr(link, "rtscts", False)
             settings_ports_cache = list_serial_ports()
-            if settings_port not in settings_ports_cache:
+            # The configured port may differ from the enumerated name only by
+            # case ("com10" in rc2014bridge.ini vs the "COM10" Windows
+            # reports) - match case-insensitively so it doesn't appear twice,
+            # and normalize the selection to the enumerated spelling.
+            for _p in settings_ports_cache:
+                if _p.upper() == settings_port.upper():
+                    settings_port = _p
+                    break
+            else:
                 settings_ports_cache = settings_ports_cache + [settings_port]
             settings_port_open = False
             settings_baud_open = False
