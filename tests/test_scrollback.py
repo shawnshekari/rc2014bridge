@@ -94,14 +94,18 @@ class TestGetScreenOsField(unittest.TestCase):
         self.addCleanup(link.close)
         return link
 
-    def test_zpm3_prompt_reports_zpm3(self):
+    def test_zpm3_style_prompt_alone_does_not_flag_zpm3(self):
+        # The whole ZCPR3 crowd (ZPM3/NZ-COM/Z3PLUS) shares the clock/named-dir
+        # prompt style, so the prompt alone must never identify the OS - only
+        # boot banners do. Seen live: an NZ-COM session badged itself ZPM3 when
+        # an app exited back to the "A0:SYSTEM>" prompt.
         link = self._link()
-        # fragmented across reads, as the real ZPM3 console delivers it
         link._update_system_state("\r\n\x1b[1m15:45")
         link._update_system_state("\x1b[m A0:SYSTEM\x1b[1m\x1b[m>")
         state = link.get_screen()
         self.assertEqual(state["system_state"], "cpm")
-        self.assertEqual(state["os"], "zpm3")
+        self.assertFalse(link._zpm3)
+        self.assertEqual(state["os"], "cpm")
 
     def test_zsdos_banner_reports_zsdos(self):
         link = self._link()

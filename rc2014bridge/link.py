@@ -1430,20 +1430,16 @@ class SerialLink:
     def _set_prompt_state(self, line_s: str):
         """Classify a prompt line into _system_state/_last_prompt.
 
-        ZPM3 prompts carry a clock prefix ("15:21 J1>") or a named
-        directory ("A0:SYSTEM>"); plain CP/M prompts are just "A>"."""
+        The prompt SHAPE deliberately does not identify the OS flavour: the
+        whole ZCPR3 crowd (ZPM3, NZ-COM, Z3PLUS) shares the clock/named-dir
+        prompt style, so flagging ZPM3 from "A0:SYSTEM>" misidentifies NZ-COM
+        sessions every time an app exits back to the shell. OS identity comes
+        from boot/loader banners only (see _update_system_state)."""
         if CPM_STATE_RE.search(line_s):
             if self._system_state != "cpm":
                 logger.info("Detected RC2014 system state: CPM (prompt: %r)", line_s)
             self._system_state = "cpm"
             self._last_prompt = line_s
-            if _ZPM3_CLOCK_RE.search(line_s) or _ZPM3_NAMED_RE.search(line_s):
-                self._zpm3 = True
-                if self._os_env is None:
-                    # ZCPR3-style prompt with no banner captured (attached
-                    # mid-session, banner scrolled off) - best guess is the
-                    # family name; a banner later overrides it.
-                    self._os_env = "zpm3"
         elif HBIOS_PROMPT_RE.search(line_s):
             if self._system_state != "hbios":
                 logger.info("Detected RC2014 system state: HBIOS (prompt: %r)", line_s)
@@ -1482,6 +1478,7 @@ class SerialLink:
             if idx >= 0 and base + idx > marker_abs:
                 marker, marker_abs = m, base + idx
         if marker:
+            logger.info("New-boot marker %r - clearing OS environment", marker)
             self._last_marker_fired_at = marker_abs
             self._zpm3 = False
             self._os_env = None
@@ -1582,11 +1579,16 @@ class SerialLink:
                     {"nzcom_version": f"NZ-COM {nzm.group(1)} ({nzm.group(2).strip()})"})
             if "Booting NZ-COM" in region:
                 self._os_env = "nzcom"
+                # NZ-COM is a ZCPR3 system - same command dialect as ZPM3
+                # (SDZ/ERASE/...), so the dialect flag comes along. The prompt
+                # shape alone must never set this (see _set_prompt_state).
+                self._zpm3 = True
 
         z3m = re.search(r"Z3PLUS.*?Vers\.\s*([\d.]+)", region, re.DOTALL)
         if z3m:
             self._merge_hw_info({"z3plus_version": f"Z3PLUS {z3m.group(1)} (CP/M Plus)"})
             self._os_env = "z3plus"
+            self._zpm3 = True  # Z3PLUS is ZCPR3 on CP/M Plus - same dialect
 
         buf = self._rx_linebuf + text
         lines = buf.split("\n")

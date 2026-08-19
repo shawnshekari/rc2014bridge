@@ -307,9 +307,34 @@ class TestZpm3Banner(unittest.TestCase):
         self.assertEqual(link.get_screen()["os"], "cpm")
         self.assertEqual(link.hardware_info.get("cpm_version"), "CP/M-80 v2.2")
 
-    def test_zpm3_clock_prompt_still_flags(self):
+    def test_zpm3_clock_prompt_alone_does_not_flag(self):
+        # Prompt shape never identifies the OS flavour (ZPM3/NZ-COM/Z3PLUS
+        # share it) - only the boot banners do.
         link = self._link()
         link._update_system_state("\x1b[1m15:21\x1b[m J1\x1b[1m\x1b[m>")
+        self.assertFalse(link._zpm3)
+
+    def test_nzcom_badge_survives_app_exit_to_prompt(self):
+        # Live bug: in an NZ-COM session, exiting an app back to the
+        # "A0:SYSTEM>" prompt flipped the badge to ZPM3. The OS environment
+        # set by the boot banners must stick until the next boot.
+        link = self._link()
+        link._update_system_state(
+            'Volume "NZ-COM" [0xD000-0xFE00, entry @ 0xE600]...\r\n'
+            "CBIOS v3.7.0-dev.8 [WBW]\r\n"
+            "ZSDOS v1.1, 54.0K TPA\r\n\r\n"
+            "A>NZCOM NZCOM.ZCM\r\n"
+            "NZCOM Version 1.2 System Loader for Z-Com v2.0\r\n"
+            "   Booting NZ-COM...\r\n\r\n"
+            "A0:SYSTEM>")
+        self.assertEqual(link.get_screen()["os"], "nzcom")
+        self.assertTrue(link._zpm3)  # ZCPR3 dialect from the NZ-COM banner
+
+        # App runs, prints a screenful, exits back to the same prompt.
+        link._update_system_state(
+            "WORDMASTER v2.0\r\n...lots of app output...\r\n"
+            "Exiting to NZ-COM...\r\n\r\nA0:SYSTEM>")
+        self.assertEqual(link.get_screen()["os"], "nzcom")
         self.assertTrue(link._zpm3)
 
     def test_sc126_cpm_boot_clears_stale_zpm3(self):
