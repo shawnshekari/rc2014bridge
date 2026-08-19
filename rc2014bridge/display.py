@@ -238,14 +238,17 @@ def _dropdown_option_rects(anchor: "pygame.Rect", options: list) -> list:
     return [pygame.Rect(anchor.x, anchor.bottom + i * 24, anchor.w, 24) for i in range(len(options))]
 
 
-def _draw_dropdown_list(surface, anchor, options: list, current_str: str, item_font):
+def _draw_dropdown_list(surface, anchor, options: list, current_str: str, item_font,
+                        mouse_pos=None):
     rects = _dropdown_option_rects(anchor, options)
     if not rects:
         return
     list_rect = pygame.Rect(anchor.x, anchor.bottom, anchor.w, rects[-1].bottom - anchor.bottom)
     pygame.draw.rect(surface, (24, 28, 34), list_rect)
     pygame.draw.rect(surface, (60, 75, 95), list_rect, width=1)
-    mx, my = pygame.mouse.get_pos()
+    # Callers pass the canvas-space mouse position (the main window is
+    # resizable, so raw window coords don't match canvas coords there).
+    mx, my = mouse_pos if mouse_pos is not None else pygame.mouse.get_pos()
     for opt, r in zip(options, rects):
         hover = r.collidepoint(mx, my)
         if hover:
@@ -491,7 +494,21 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
     term_h = link.rows * cell_h
     term_y = TOP_MENU_HEIGHT
     screen_h = TOP_MENU_HEIGHT + term_h + STATUS_BAR_HEIGHT
-    surface = pygame.display.set_mode((screen_w, screen_h))
+    # Every draw targets `surface`, a fixed-size logical canvas; the actual
+    # window is resizable and the canvas is scaled into it at flip time.
+    # Mouse coordinates are mapped back through the same scale via _map_pos.
+    surface = pygame.Surface((screen_w, screen_h))
+    window = pygame.display.set_mode((screen_w, screen_h), pygame.RESIZABLE)
+
+    def _map_pos(pos):
+        """Window-space mouse coords -> logical canvas coords (identity when
+        the window is exactly the canvas size). Clamped so hit-tests never
+        see out-of-canvas positions."""
+        ww, wh = window.get_size()
+        if (ww, wh) == (screen_w, screen_h):
+            return pos
+        return (min(max(int(pos[0] * screen_w / ww), 0), screen_w - 1),
+                min(max(int(pos[1] * screen_h / wh), 0), screen_h - 1))
     pygame.scrap.init()  # needs the window to exist (Windows scrap is window-bound)
     pygame.key.set_repeat(500, 33)  # Tera Term-style autorepeat: 500ms delay, ~30/s
     clock = pygame.time.Clock()
@@ -741,7 +758,7 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         settings_status = (f"Not connected: {link.port} not found", False)
 
     while running:
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = _map_pos(pygame.mouse.get_pos())
 
         for event in pygame.event.get():
             # The primary window's own events always have event.window is
@@ -754,6 +771,12 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         pw.handle_event(event)
                         break
                 continue
+            if event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN,
+                              pygame.MOUSEBUTTONUP):
+                # Drawing happens in fixed canvas coordinates (the canvas is
+                # scaled into the resizable window at flip time), so map the
+                # window-space click/motion position back before hit-testing.
+                event.pos = _map_pos(event.pos)
             if event.type == pygame.QUIT:
                 running = False
             elif hasattr(pygame, "MOUSEWHEEL") and event.type == pygame.MOUSEWHEEL:
@@ -1370,9 +1393,11 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
 
             # Dropdown overlays drawn last so they sit above the buttons/fields.
             if settings_port_open:
-                _draw_dropdown_list(surface, layout["port_field"], settings_ports_cache, settings_port, font)
+                _draw_dropdown_list(surface, layout["port_field"], settings_ports_cache,
+                                    settings_port, font, mouse_pos)
             if settings_baud_open:
-                _draw_dropdown_list(surface, layout["baud_field"], list(BAUD_CHOICES), str(settings_baud), font)
+                _draw_dropdown_list(surface, layout["baud_field"], list(BAUD_CHOICES),
+                                    str(settings_baud), font, mouse_pos)
 
         # --------------------------------------------------------------
         # 6. Render Notification Toast (if active)
@@ -1507,6 +1532,13 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     surface.blit(prog_img, prog_img.get_rect(
                         center=(pbar_x + pbar_w // 2, status_y + STATUS_BAR_HEIGHT // 2)))
 
+        # Present: blit the logical canvas into the (possibly resized)
+        # window, scaling when the two differ.
+        win_size = window.get_size()
+        if win_size != (screen_w, screen_h):
+            pygame.transform.smoothscale(surface, win_size, window)
+        else:
+            window.blit(surface, (0, 0))
         pygame.display.flip()
         clock.tick(60)
 
