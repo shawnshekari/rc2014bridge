@@ -692,7 +692,8 @@ class SerialLink:
                  hw_info_file: str = "hardware_info.json",
                  text_pacing: tuple[int, float] = None,
                  xmodem_pacing: tuple[int, float] = None,
-                 rtscts: bool = False):
+                 rtscts: bool = False,
+                 xm_command: str = ""):
         # Windows accepts COMn in any case but enumerates it uppercase;
         # normalize so the status bar/dropdown don't show "com10" and
         # case-mismatched port strings never reach the same-port checks.
@@ -707,6 +708,9 @@ class SerialLink:
         # _check_for_baud_mismatch() has something stable to fall back to
         # if the board resets back to its power-on rate mid-session.
         self._default_baud = baud
+        # Optional override for the XM invocation used by upload()/download()
+        # (e.g. "XM" to use the current drive's copy instead of the ROM disk's).
+        self._xm_command_override = xm_command
         self._garbage_streak = 0
         self._last_garbage_recovery_at = 0.0
         self.cols, self.rows = cols, rows
@@ -940,6 +944,8 @@ class SerialLink:
         return ""
 
     def _xm_command(self) -> str:
+        if self._xm_command_override:
+            return self._xm_command_override
         rom = self._rom_disk_drive()
         return f"{rom}:XM" if rom else "XM"
 
