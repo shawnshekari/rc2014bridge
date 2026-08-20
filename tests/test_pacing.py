@@ -93,18 +93,16 @@ class TestCalibration(unittest.TestCase):
 
     def _stub_transfers(self, fails_at=None):
         """Accept every pacing up to `fails_at` (a (chunk, delay) tuple)."""
-        def _upload(local_path, **kwargs):
+        def _upload(name, drive, user=0, content="", binary=False, overwrite=False, **kwargs):
+            import base64
             self.tried.append(self.link.xmodem_pacing)
             if self.link.xmodem_pacing == fails_at:
                 return {"ok": False, "error": "block 3 failed after 10 retries"}
-            with open(local_path, "rb") as f:
-                self._payload = f.read()
+            self._payload = base64.b64decode(content)
             return {"ok": True, "blocks": 32}
 
-        def _download(cpm_path, local_path=None, **kwargs):
+        def _download(name, drive, user=0, binary=False, **kwargs):
             import hashlib
-            with open(local_path, "wb") as f:
-                f.write(self._payload)
             return {"ok": True, "bytes": len(self._payload),
                     "sha256": hashlib.sha256(self._payload).hexdigest()}
 
@@ -157,13 +155,13 @@ class TestCalibration(unittest.TestCase):
         self._stub_transfers()
         real_upload = self.link.upload
 
-        def _upload(local_path, **kwargs):
-            captured.update(kwargs)
-            return real_upload(local_path, **kwargs)
+        def _upload(name, drive, **kwargs):
+            captured["drive"] = drive
+            return real_upload(name, drive, **kwargs)
 
         self.link.upload = _upload
         self.link.calibrate_pacing(test_bytes=1024)
-        self.assertEqual(captured["dest_drive"], "B:", "MD0 is the volatile RAM disk here")
+        self.assertEqual(captured["drive"], "B:", "MD0 is the volatile RAM disk here")
 
     def test_small_samples_do_not_get_a_throughput_projection(self):
         """A 4KB test understated the real rate 5x, because ~15s of fixed

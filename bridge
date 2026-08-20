@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Start the rc2014bridge GUI + MCP server (macOS / Linux / Git Bash on Windows).
+#
+# Usage:
+#   bridge [serial-port] [baud] [extra app args...]
+#
+# Defaults: serial port auto-detected (RC2014_PORT overrides), baud 115200
+# (RC2014_BAUD overrides). MCP listens on 127.0.0.1:8014.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# --- default serial port per OS ---------------------------------------------
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) DEFAULT_PORT="" ;;  # no sane auto-detect on Windows; pass it or set RC2014_PORT
+  Darwin*)              DEFAULT_PORT=$(ls /dev/cu.usbserial-* 2>/dev/null | head -1 || true) ;;
+  *)                    DEFAULT_PORT=$(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | head -1 || true) ;;
+esac
+
+PORT="${1:-${RC2014_PORT:-$DEFAULT_PORT}}"
+[ $# -gt 0 ] && shift || true
+BAUD="${1:-${RC2014_BAUD:-115200}}"
+[ $# -gt 0 ] && shift || true
+
+if [ -z "$PORT" ]; then
+  echo "bridge: no serial port found; pass one explicitly: bridge /dev/ttyUSB0" >&2
+  exit 1
+fi
+
+# --- python: repo venv first, then RC2014_VENV, then system python ----------
+PY=""
+for cand in .venv/Scripts/python.exe .venv/bin/python \
+            "${RC2014_VENV:-}/Scripts/python.exe" "${RC2014_VENV:-}/bin/python"; do
+  [ -n "$cand" ] && [ -x "$cand" ] && { PY="$cand"; break; }
+done
+if [ -z "$PY" ]; then
+  PY=$(command -v python3 || command -v python) || {
+    echo "bridge: no python found (set RC2014_VENV to your venv)" >&2; exit 1; }
+fi
+
+exec "$PY" -m rc2014bridge.app --port "$PORT" --baud "$BAUD" --mcp-host 127.0.0.1 "$@"

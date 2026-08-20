@@ -25,11 +25,12 @@ import pygame
 from pygame._sdl2.video import Renderer, Texture, Window
 
 from rc2014bridge import config as bridge_config
-from rc2014bridge.link import list_serial_ports, probe_serial_connection
+from rc2014bridge.link import list_serial_ports
 
-FG = (110, 255, 110)
+FG = (229, 229, 229)
+FG_BOLD = (255, 255, 255)   # bold default-color text: bright white (industry convention)
 BG = (10, 12, 10)
-CURSOR = (110, 255, 110)
+CURSOR = (192, 192, 192)
 FONT_SIZE = 18
 CURSOR_BLINK_MS = 500
 
@@ -64,8 +65,10 @@ STANDARD_TO_BRIGHT = {
 }
 
 
-def _resolve_color(color_val: str, default_rgb: tuple[int, int, int], is_bold: bool = False) -> tuple[int, int, int]:
+def _resolve_color(color_val: str, default_rgb: tuple[int, int, int], is_bold: bool = False, bold_default_rgb: tuple[int, int, int] | None = None) -> tuple[int, int, int]:
     if color_val == "default":
+        if is_bold and bold_default_rgb is not None:
+            return bold_default_rgb
         return default_rgb
     color_name = color_val
     if is_bold and color_name in STANDARD_TO_BRIGHT:
@@ -129,8 +132,19 @@ def _allowed_during_transfer(data: bytes) -> bool:
 def _key_to_bytes(event) -> bytes:
     if event.key in SPECIAL_KEYS:
         return SPECIAL_KEYS[event.key]
-    if event.mod & pygame.KMOD_CTRL and pygame.K_a <= event.key <= pygame.K_z:
-        return bytes([event.key - pygame.K_a + 1])  # Ctrl-A..Ctrl-Z -> 0x01..0x1A
+    if event.mod & pygame.KMOD_CTRL:
+        if pygame.K_a <= event.key <= pygame.K_z:
+            return bytes([event.key - pygame.K_a + 1])  # Ctrl-A..Ctrl-Z -> 0x01..0x1A
+        ctrl_punct = {  # Ctrl with punctuation -> 0x1B..0x1F (US layout)
+            pygame.K_LEFTBRACKET: 0x1B,   # Ctrl-[
+            pygame.K_BACKSLASH: 0x1C,     # Ctrl-\
+            pygame.K_RIGHTBRACKET: 0x1D,  # Ctrl-]  (MSX8 game quit hotkey)
+            pygame.K_6: 0x1E,             # Ctrl-^
+            pygame.K_MINUS: 0x1F,         # Ctrl-_
+        }
+        if event.key in ctrl_punct:
+            return bytes([ctrl_punct[event.key]])
+        return b""
     if event.unicode:
         try:
             return event.unicode.encode("latin-1")
@@ -141,6 +155,7 @@ def _key_to_bytes(event) -> bytes:
 
 TOP_MENU_HEIGHT = 32
 STATUS_BAR_HEIGHT = 32
+SCROLLBAR_W = 14
 
 # Presets offered in the Settings screen's baud dropdown. Standard rates a
 # RC2014 UART (Z80 SIO/ACIA or 16550-alike) can plausibly be run at; any
@@ -182,7 +197,8 @@ MENU_DATA = [
 ]
 
 
-def _settings_modal_layout(screen_w: int, screen_h: int) -> dict:
+def _settings_modal_layout(screen_w: int, screen_h: int,
+                           cell_w: int = 1, cell_h: int = 1, term_y: int = 0) -> dict:
     """Rects for the Connection Settings modal - shared between the click
     handler and the renderer so hit-testing and drawing never drift apart.
 
@@ -191,10 +207,15 @@ def _settings_modal_layout(screen_w: int, screen_h: int) -> dict:
     ~171px in the 16pt bold monospace menu/status font), plus padding -
     not guessed round numbers, which is what let the label and button text
     overlap their neighbors before.
+
+    With the grid metrics supplied (cell_w/cell_h/term_y), the box is snapped
+    to character-cell boundaries so the frame never slices a glyph in the
+    terminal behind it.
     """
-    box_w, box_h = min(600, screen_w - 20), min(300, screen_h - 40)
-    box_x = (screen_w - box_w) // 2
-    box_y = (screen_h - box_h) // 2
+    box_w = min(600, (screen_w // cell_w - 2) * cell_w) // cell_w * cell_w
+    box_h = min(300, ((screen_h - term_y) // cell_h - 2) * cell_h) // cell_h * cell_h
+    box_x = ((screen_w - box_w) // 2) // cell_w * cell_w
+    box_y = term_y + ((screen_h - term_y - box_h) // 2) // cell_h * cell_h
     field_x = box_x + 250
     field_w = box_w - 250 - 16
 
@@ -471,14 +492,83 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
     menu_font = pygame.font.SysFont("monospace", 16, bold=True)
     status_font = pygame.font.SysFont("monospace", 16, bold=True)
     cell_w, cell_h = font.size("M")
-    screen_w = link.cols * cell_w
+    term_w = link.cols * cell_w
+    screen_w = term_w + SCROLLBAR_W
     term_h = link.rows * cell_h
     term_y = TOP_MENU_HEIGHT
     screen_h = TOP_MENU_HEIGHT + term_h + STATUS_BAR_HEIGHT
-    surface = pygame.display.set_mode((screen_w, screen_h))
+    # The actual window is resizable; the terminal re-grids to fit it (fixed
+    # font/cell size - a smaller window shows fewer columns/rows, never a
+    # scaled-down font). `surface` is a canvas exactly matching the current
+    # grid, so window coords and canvas coords stay 1:1 and no mouse mapping
+    # is needed; the canvas is rebuilt whenever the grid changes.
+    surface = pygame.Surface((screen_w, screen_h))
+    window = pygame.display.set_mode((screen_w, screen_h), pygame.RESIZABLE)
+    pygame.scrap.init()  # needs the window to exist (Windows scrap is window-bound)
+    pygame.key.set_repeat(500, 33)  # Tera Term-style autorepeat: 500ms delay, ~30/s
     clock = pygame.time.Clock()
 
     scroll_offset = 0
+    sb_history = 0      # scrollback lines available, synced from get_screen()
+    sb_offset = 0       # clamped scroll offset, synced from get_screen()
+    scrollbar_drag = False
+    drag_grab_dy = 0
+    sel_anchor = None       # (col,absrow) where the current selection drag began
+    sel_cells = None        # normalized ((c0,absr0),(c1,absr1)) of the selection
+    sel_dragging = False
+    last_lines = []         # lines currently on display, for copy extraction
+
+    def _cell_at(mx, my):
+        c = min(max(mx, 0) // cell_w, link.cols - 1)
+        r = min(max(my - term_y, 0) // cell_h, link.rows - 1)
+        return c, r
+
+    def _sel_base():
+        # Absolute scrollback line number of the top displayed row. Rows in
+        # sel_anchor/sel_cells are absolute so the highlight stays glued to
+        # the text - scrolling (or new output pushing lines up) shifts the
+        # view, not the selection.
+        return sb_history - sb_offset
+
+    def _sel_normalize(a, b):
+        return (b, a) if (b[1], b[0]) < (a[1], a[0]) else (a, b)
+
+    def _selection_text():
+        if not sel_cells:
+            return ""
+        (c0, r0), (c1, r1) = sel_cells
+        base = _sel_base()
+        out = []
+        for r_abs in range(r0, r1 + 1):
+            r = r_abs - base
+            if r < 0:
+                continue
+            if r >= len(last_lines):
+                break
+            line = last_lines[r]
+            a = c0 if r_abs == r0 else 0
+            b = c1 + 1 if r_abs == r1 else link.cols
+            out.append(line[a:b].rstrip())
+        return "\r\n".join(out)
+
+    def _paste_clipboard():
+        clip = pygame.scrap.get(pygame.SCRAP_TEXT)
+        if not clip:
+            return
+        text = clip.decode("utf-8", "replace").replace("\x00", "")
+        text = text.replace("\r\n", "\r").replace("\n", "\r")
+        if text:
+            link.send_text(text, append_enter=False)
+
+    def _sb_thumb_rect():
+        """Scrollbar thumb rect for the current sb_offset/sb_history, or None."""
+        if sb_history <= 0:
+            return None
+        frac = link.rows / (link.rows + sb_history)
+        thumb_h = max(20, int(term_h * frac))
+        pos = 1.0 - (sb_offset / sb_history)
+        thumb_y = term_y + int(pos * (term_h - thumb_h))
+        return pygame.Rect(term_w, thumb_y, SCROLLBAR_W, thumb_h)
     prompt_mode = None  # None, "SEND", "RECEIVE"
     prompt_text = ""
     show_reboot_modal = False
@@ -527,9 +617,10 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
 
         def _worker():
             nonlocal settings_status
-            res = probe_serial_connection(port, baud, rtscts)
+            res = link.probe_connection(port, baud, rtscts)
             if res.get("ok"):
-                settings_status = (f"OK: {port} @ {baud} baud opened successfully", True)
+                note = " (already connected)" if res.get("already_connected") else ""
+                settings_status = (f"OK: {port} @ {baud} baud opened successfully{note}", True)
             else:
                 settings_status = (f"Failed: {res.get('error', 'unknown error')}", False)
 
@@ -634,7 +725,15 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             settings_baud = link.baud
             settings_rtscts = getattr(link, "rtscts", False)
             settings_ports_cache = list_serial_ports()
-            if settings_port not in settings_ports_cache:
+            # The configured port may differ from the enumerated name only by
+            # case ("com10" in rc2014bridge.ini vs the "COM10" Windows
+            # reports) - match case-insensitively so it doesn't appear twice,
+            # and normalize the selection to the enumerated spelling.
+            for _p in settings_ports_cache:
+                if _p.upper() == settings_port.upper():
+                    settings_port = _p
+                    break
+            else:
                 settings_ports_cache = settings_ports_cache + [settings_port]
             settings_port_open = False
             settings_baud_open = False
@@ -654,6 +753,20 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         settings_status = (f"Not connected: {link.port} not found", False)
 
     while running:
+        # Re-grid to the window size. The canvas is rebuilt to match the new
+        # grid exactly; the window itself may be a few px larger (non
+        # cell-multiple), which the present step pads with background.
+        ww, wh = window.get_size()
+        new_cols = max(20, (ww - SCROLLBAR_W) // cell_w)
+        new_rows = max(5, (wh - TOP_MENU_HEIGHT - STATUS_BAR_HEIGHT) // cell_h)
+        if (new_cols, new_rows) != (link.cols, link.rows):
+            link.resize_terminal(new_cols, new_rows)
+            term_w = link.cols * cell_w
+            screen_w = term_w + SCROLLBAR_W
+            term_h = link.rows * cell_h
+            screen_h = TOP_MENU_HEIGHT + term_h + STATUS_BAR_HEIGHT
+            surface = pygame.Surface((screen_w, screen_h))
+
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
@@ -674,6 +787,30 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     scroll_offset += 3 * event.y
                 elif event.y < 0:
                     scroll_offset = max(0, scroll_offset + 3 * event.y)
+            elif event.type == pygame.MOUSEMOTION:
+                if scrollbar_drag and sb_history > 0:
+                    frac = link.rows / (link.rows + sb_history)
+                    thumb_h = max(20, int(term_h * frac))
+                    travel = term_h - thumb_h
+                    if travel > 0:
+                        pos = (event.pos[1] - term_y - drag_grab_dy) / travel
+                        pos = min(1.0, max(0.0, pos))
+                        scroll_offset = int(round((1.0 - pos) * sb_history))
+                if sel_dragging:
+                    sel_cells = _sel_normalize(
+                        sel_anchor, (_cell_at(*event.pos)[0],
+                                     _cell_at(*event.pos)[1] + _sel_base()))
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                scrollbar_drag = False
+                if sel_dragging:
+                    sel_dragging = False
+                    if sel_cells and sel_cells[0] != sel_cells[1]:
+                        # Tera Term style: the selection alone copies to the clipboard
+                        text = _selection_text()
+                        if text:
+                            pygame.scrap.put(pygame.SCRAP_TEXT, text.encode("utf-8"))
+                    else:
+                        sel_cells = None  # plain click clears the selection
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
                 if show_hw_info_modal:
@@ -686,7 +823,8 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     continue
 
                 if show_settings_modal:
-                    layout = _settings_modal_layout(screen_w, screen_h)
+                    layout = _settings_modal_layout(screen_w, screen_h,
+                                                    cell_w, cell_h, term_y)
 
                     if settings_port_open:
                         opt_rects = _dropdown_option_rects(layout["port_field"], settings_ports_cache)
@@ -724,6 +862,18 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         show_settings_modal = False
                     continue
 
+                if mx >= term_w and term_y <= my < term_y + term_h:
+                    thumb = _sb_thumb_rect()
+                    if thumb is not None and thumb.collidepoint(mx, my):
+                        scrollbar_drag = True
+                        drag_grab_dy = my - thumb.top
+                    elif sb_history > 0:
+                        if thumb is not None and my < thumb.top:
+                            scroll_offset = min(sb_history, scroll_offset + link.rows)
+                        else:
+                            scroll_offset = max(0, scroll_offset - link.rows)
+                    continue
+
                 clicked_menu_item = False
                 if active_menu_idx is not None:
                     top_x = 8
@@ -754,7 +904,18 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                                 break
                             top_x += header_w + 4
                     else:
-                        active_menu_idx = None
+                        if active_menu_idx is not None:
+                            active_menu_idx = None  # click only dismisses the menu
+                        elif term_y <= my < term_y + term_h and mx < term_w:
+                            c, r = _cell_at(mx, my)
+                            sel_anchor = (c, r + _sel_base())
+                            sel_cells = None
+                            sel_dragging = True
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                mx, my = event.pos
+                if (my >= term_y and not show_hw_info_modal and not show_reboot_modal
+                        and prompt_mode is None):
+                    _paste_clipboard()
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 4:  # Wheel up
                     scroll_offset += 3
@@ -825,6 +986,9 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     continue
 
                 if event.mod & pygame.KMOD_SHIFT:
+                    if event.key == pygame.K_INSERT:
+                        _paste_clipboard()
+                        continue
                     if event.key == pygame.K_PAGEUP:
                         scroll_offset += 10
                         continue
@@ -882,6 +1046,9 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
 
         state = link.get_screen(scroll_offset=scroll_offset)
         scroll_offset = state.get("scroll_offset", 0)
+        sb_history = state.get("history_count", 0)
+        sb_offset = state.get("scroll_offset", 0)
+        last_lines = state.get("lines", [])
         surface.fill(BG)
 
         # The banner arrives after startup, so the machine's identity only
@@ -934,7 +1101,7 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         reverse = run_data.get("reverse", False)
                         underscore = run_data.get("underscore", False)
 
-                        fg_rgb = _resolve_color(fg_val, FG, is_bold=bold)
+                        fg_rgb = _resolve_color(fg_val, FG, is_bold=bold, bold_default_rgb=FG_BOLD)
                         bg_rgb = _resolve_color(bg_val, BG)
 
                         if reverse:
@@ -956,16 +1123,35 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                         img = font.render(line, False, FG, BG)
                         surface.blit(img, (0, term_y + row * cell_h))
 
+            # Selection highlight (drawn over the text, under the cursor).
+            # sel_cells rows are absolute scrollback lines - map back to view
+            # rows so the highlight tracks the text through scrolls.
+            if sel_cells:
+                (c0, r0), (c1, r1) = sel_cells
+                base = _sel_base()
+                overlay = pygame.Surface((term_w, term_h), pygame.SRCALPHA)
+                for r_abs in range(r0, r1 + 1):
+                    r = r_abs - base
+                    if r < 0 or r >= link.rows:
+                        continue
+                    a = c0 if r_abs == r0 else 0
+                    b = c1 if r_abs == r1 else link.cols - 1
+                    overlay.fill((255, 255, 255, 60),
+                                 (a * cell_w, r * cell_h, (b - a + 1) * cell_w, cell_h))
+                surface.blit(overlay, (0, term_y))
+
             if scroll_offset == 0 and (pygame.time.get_ticks() // CURSOR_BLINK_MS) % 2 == 0:
                 cx, cy = state["cursor"]["x"], state["cursor"]["y"]
                 rect = pygame.Rect(cx * cell_w, term_y + cy * cell_h, cell_w, cell_h)
                 pygame.draw.rect(surface, CURSOR, rect, width=2)
 
-        if scroll_offset > 0:
-            badge_text = f" SCROLLBACK: -{scroll_offset} lines (Shift+End to exit) "
-            badge_img = font.render(badge_text, True, (255, 255, 255), (140, 30, 30))
-            badge_rect = badge_img.get_rect(topright=(screen_w - 5, term_y + 5))
-            surface.blit(badge_img, badge_rect)
+        # Scrollbar: always a dim track on the right edge of the terminal;
+        # a thumb appears once there is scrollback to move through.
+        pygame.draw.rect(surface, (22, 26, 24), (term_w, term_y, SCROLLBAR_W, term_h))
+        thumb = _sb_thumb_rect()
+        if thumb is not None:
+            thumb_color = (150, 170, 150) if scrollbar_drag else (95, 115, 95)
+            pygame.draw.rect(surface, thumb_color, thumb.inflate(-2, 0), border_radius=4)
 
         # --------------------------------------------------------------
         # 2. Render Top Menu Header Bar
@@ -1060,9 +1246,79 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         # --------------------------------------------------------------
         if show_hw_info_modal:
             hw_info = getattr(link, "hardware_info", {})
-            box_w, box_h = min(720, screen_w - 20), min(500, screen_h - 40)
-            box_x = (screen_w - box_w) // 2
-            box_y = (screen_h - box_h) // 2
+            # Snap the frame to the terminal's character grid: a pixel-centred
+            # box slices through cells, leaving half-glyphs hanging off the
+            # left/right edges (the grid starts at term_y, so y snaps relative
+            # to it, not to the canvas top).
+            hdr_img = menu_font.render(" RC2014 Hardware, OS & Disk Drive Inventory ", True, (255, 255, 255))
+            close_hint = status_font.render("[Esc/F5 to Close]", True, (180, 210, 240))
+
+            # Hardware & OS specs, as captured from the boot banner. Shown as
+            # "not captured" rather than a plausible-looking guess, so the panel
+            # never claims specs for a machine it hasn't actually read.
+            not_captured = "not captured - reboot to capture"
+            os_line = (hw_info.get("nzcom_version") or hw_info.get("z3plus_version")
+                       or hw_info.get("zpm3_version") or hw_info.get("cpm3_version")
+                       or hw_info.get("zsdos_version") or hw_info.get("cpm_version")
+                       or "")
+            if os_line and hw_info.get("boot_volume"):
+                os_line = f"{os_line} - volume {hw_info['boot_volume']}"
+            if os_line and hw_info.get("tpa"):
+                os_line = f"{os_line} ({hw_info['tpa']})"
+            spec_rows = [
+                (menu_font.render(f" {label:<18}", True, (140, 180, 220)),
+                 menu_font.render(f"{val}", True, (255, 255, 255)))
+                for label, val in [
+                    ("RomWBW Version:", hw_info.get("version") or not_captured),
+                    ("CPU Architecture:", hw_info.get("cpu") or not_captured),
+                    ("Memory / MMU:", hw_info.get("memory") or not_captured),
+                    ("Operating System:", os_line or not_captured),
+                ]
+            ]
+            dev_hdr = menu_font.render(" Disk Drive Catalogue (F6 to Scan):", True, (140, 180, 220))
+
+            drives = hw_info.get("drives", [])
+            if not drives:
+                drives_map = hw_info.get("drive_mappings", {})
+                drives = [
+                    {"drive": f"{k}:", "device": v, "files_count": "?", "purpose": "Unscanned (Press F6 to Catalog)"}
+                    for k, v in list(drives_map.items())[:10]
+                ]
+            drive_rows = []
+            for drv in drives:
+                d_name = drv.get("drive", "")
+                d_dev = drv.get("device", "")
+                d_count = drv.get("files_count", 0)
+                d_free = drv.get("free_space", "")
+                d_purp = drv.get("purpose", "")
+                space_str = f", {d_free} free" if d_free and d_free != "?" else ""
+                drive_rows.append((
+                    font.render(f"   * {d_name:<3} [{d_dev:<7}] ({d_count:>2} files{space_str})", True, (200, 230, 200)),
+                    font.render(f" -> {d_purp}", True, (255, 215, 120))))
+
+            # The purpose column shares one x for every row - the widest label
+            # sets it - so the arrows form a straight line instead of following
+            # each row's own free-space string length.
+            purp_x_off = 12 + max((l.get_width() for l, _ in drive_rows), default=0) + 10
+
+            # Size the box to its content, not the other way round: a fixed
+            # 720px width let the purpose column spill past the right edge
+            # whenever a row ran long.
+            content_w = max(
+                [12 + 200 + v.get_width() for _, v in spec_rows]
+                + [purp_x_off + p.get_width() for _, p in drive_rows]
+                + [12 + dev_hdr.get_width(),
+                   8 + hdr_img.get_width() + 20 + close_hint.get_width() + 10]) + 12
+            row_h = 22
+            content_h = 38 + 24 * len(spec_rows) + 6 + 24 + row_h * max(1, len(drive_rows)) + 12
+            max_box_w = (screen_w // cell_w - 2) * cell_w
+            max_box_h = ((screen_h - term_y) // cell_h - 2) * cell_h
+            # Snap UP to whole cells when the content fits: snapping down
+            # would shave pixels off the longest line.
+            box_w = (-(-content_w // cell_w)) * cell_w if content_w <= max_box_w else max_box_w
+            box_h = (-(-content_h // cell_h)) * cell_h if content_h <= max_box_h else max_box_h
+            box_x = ((screen_w - box_w) // 2) // cell_w * cell_w
+            box_y = term_y + ((screen_h - term_y - box_h) // 2) // cell_h * cell_h
             modal_rect = pygame.Rect(box_x, box_y, box_w, box_h)
 
             pygame.draw.rect(surface, (20, 24, 30), modal_rect)
@@ -1073,67 +1329,43 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             pygame.draw.rect(surface, (30, 50, 80), hdr_rect)
             pygame.draw.line(surface, (60, 110, 180), (box_x, box_y + 31), (box_x + box_w, box_y + 31))
 
-            hdr_img = menu_font.render(" RC2014 Hardware, OS & Disk Drive Inventory ", True, (255, 255, 255))
+            # Never let text bleed past the frame, content-sized box or not
+            # (a very narrow window can still force the box smaller than the
+            # longest line).
+            surface.set_clip(modal_rect)
             surface.blit(hdr_img, (box_x + 8, box_y + 6))
-
-            close_hint = status_font.render("[Esc/F5 to Close]", True, (180, 210, 240))
             surface.blit(close_hint, (box_x + box_w - close_hint.get_width() - 10, box_y + 6))
 
-            # Hardware & ZSDOS specs, as captured from the boot banner. Shown as
-            # "not captured" rather than a plausible-looking guess, so the panel
-            # never claims specs for a machine it hasn't actually read.
             y_curr = box_y + 38
-            not_captured = "not captured - reboot to capture"
-            os_line = hw_info.get("zsdos_version") or ""
-            if os_line and hw_info.get("tpa"):
-                os_line = f"{os_line} ({hw_info['tpa']})"
-            lines_to_show = [
-                ("RomWBW Version:", hw_info.get("version") or not_captured),
-                ("CPU Architecture:", hw_info.get("cpu") or not_captured),
-                ("Memory / MMU:", hw_info.get("memory") or not_captured),
-                ("ZSDOS / CBIOS:", os_line or not_captured),
-            ]
-
-            for label, val in lines_to_show:
-                lbl_img = menu_font.render(f" {label:<18}", True, (140, 180, 220))
-                val_img = menu_font.render(f"{val}", True, (255, 255, 255))
+            for lbl_img, val_img in spec_rows:
                 surface.blit(lbl_img, (box_x + 12, y_curr))
                 surface.blit(val_img, (box_x + 200, y_curr))
                 y_curr += 24
 
             # Scanned Drive Inventory Table
             y_curr += 6
-            dev_hdr = menu_font.render(" Cataloged Disk Drive Inventory (F6 to Scan):", True, (140, 180, 220))
             surface.blit(dev_hdr, (box_x + 12, y_curr))
             y_curr += 24
 
-            drives = hw_info.get("drives", [])
-            if not drives:
-                drives_map = hw_info.get("drive_mappings", {})
-                drives = [
-                    {"drive": f"{k}:", "device": v, "files_count": "?", "purpose": "Unscanned (Press F6 to Catalog)"}
-                    for k, v in list(drives_map.items())[:10]
-                ]
-
-            for drv in drives[:10]:
-                d_name = drv.get("drive", "")
-                d_dev = drv.get("device", "")
-                d_count = drv.get("files_count", 0)
-                d_free = drv.get("free_space", "")
-                d_purp = drv.get("purpose", "")
-
-                space_str = f", {d_free} free" if d_free and d_free != "?" else ""
-                lbl_img = font.render(f"   * {d_name:<3} [{d_dev:<7}] ({d_count:>2} files{space_str})", True, (200, 230, 200))
-                purp_img = font.render(f" -> {d_purp}", True, (255, 215, 120))
+            # Fit as many rows as the box has room for; say how many were
+            # clipped instead of silently dropping them.
+            max_rows = max(1, (box_y + box_h - 12 - y_curr) // row_h)
+            for lbl_img, purp_img in drive_rows[:max_rows]:
                 surface.blit(lbl_img, (box_x + 12, y_curr))
-                surface.blit(purp_img, (box_x + 12 + lbl_img.get_width() + 10, y_curr))
-                y_curr += 22
+                surface.blit(purp_img, (box_x + purp_x_off, y_curr))
+                y_curr += row_h
+
+            if len(drive_rows) > max_rows:
+                more_img = font.render(f"   ... and {len(drive_rows) - max_rows} more drive(s)", True, (150, 170, 190))
+                surface.blit(more_img, (box_x + 12, y_curr))
+            surface.set_clip(None)
 
         # --------------------------------------------------------------
         # 5b. Render Connection Settings Modal Overlay (if active)
         # --------------------------------------------------------------
         if show_settings_modal:
-            layout = _settings_modal_layout(screen_w, screen_h)
+            layout = _settings_modal_layout(screen_w, screen_h,
+                                            cell_w, cell_h, term_y)
             box = layout["box"]
 
             pygame.draw.rect(surface, (20, 24, 30), box)
@@ -1251,7 +1483,13 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             badge_bg = (30, 110, 180)
             badge_fg = (210, 240, 255)
         elif sys_env == "CPM":
-            mode_label = "CPM/ZSDOS"
+            # Report the actual OS environment, not just the family: the
+            # ZCPR3 crowd (ZPM3/NZ-COM/Z3PLUS) speaks a different command
+            # dialect (SDZ/ERASE/UNZIPZ /E), and seeing which one is up
+            # explains which commands will work.
+            os_flavor = state.get("os", "")
+            mode_label = {"zpm3": "ZPM3", "nzcom": "NZ-COM", "z3plus": "Z3PLUS",
+                          "cpm3": "CP/M 3", "zsdos": "ZSDOS"}.get(os_flavor, "CPM")
             badge_bg = (24, 85, 45)
             badge_fg = (140, 255, 170)
         elif sys_env == "HBIOS":
@@ -1306,8 +1544,19 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             cur_b = xp.get("current_block", 0)
             tot_b = xp.get("total_blocks", 0)
             pct = (cur_b / tot_b * 100.0) if tot_b > 0 else 0.0
-            prog_str = (f"{filename}: {int(pct)}% ({cur_b}/{tot_b})" if tot_b > 0
-                        else f"{filename}: {cur_b} blks")
+            # Average rate since the first block moved - the handshake wait is
+            # excluded so the number reflects the wire, not the receiver's
+            # startup. Bytes are 128/1024-byte blocks, so this stays meaningful
+            # even when total_blocks is unknown (receives).
+            rate_str = ""
+            start_time = xp.get("start_time")
+            bytes_done = xp.get("bytes", 0)
+            if start_time is not None and bytes_done > 0:
+                elapsed = time.monotonic() - start_time
+                if elapsed > 0.2:
+                    rate_str = f" @ {bytes_done / elapsed / 1024.0:.1f} KB/s"
+            prog_str = (f"{filename}: {int(pct)}% ({cur_b}/{tot_b}){rate_str}" if tot_b > 0
+                        else f"{filename}: {cur_b} blks{rate_str}")
             prog_img = status_font.render(prog_str, True, (255, 255, 255))
 
             gap_start, gap_end = left_edge + 10, right_edge - 10
@@ -1329,8 +1578,13 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     surface.blit(prog_img, prog_img.get_rect(
                         center=(pbar_x + pbar_w // 2, status_y + STATUS_BAR_HEIGHT // 2)))
 
+        # Present: the window can be a few px larger than the canvas (window
+        # sizes are not cell-multiples), so clear the slack before blitting.
+        if window.get_size() != surface.get_size():
+            window.fill(BG)
+        window.blit(surface, (0, 0))
         pygame.display.flip()
-        clock.tick(30)
+        clock.tick(60)
 
     for pw in pixel_windows:
         pw.destroy()

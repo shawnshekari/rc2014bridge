@@ -39,6 +39,11 @@ class FakeSerial:
         a.peer, b.peer = b, a
         return a, b
 
+    @property
+    def in_waiting(self) -> int:
+        with self._lock:
+            return len(self._rx)
+
     def read(self, size: int = 1) -> bytes:
         if not self.is_open:
             # Mirrors real pyserial: reading a closed port raises rather than

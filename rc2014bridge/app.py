@@ -76,6 +76,9 @@ def main():
                    help="Enable hardware RTS/CTS flow control on the serial port. "
                         "Experimental: only meaningful if both the board and the cable "
                         "actually wire CTS/RTS through (default: off)")
+    p.add_argument("--xm-command", metavar="CMD", default=_cfg_str(cfg, "xm-command", ""),
+                   help="Override how XM is invoked for transfers, e.g. 'XM' to use the "
+                        "current drive's copy instead of the ROM disk's (default: ROM disk)")
     p.add_argument("--verbose", "-v", action="store_true", default=_cfg_bool(cfg, "verbose", False),
                    help="Enable DEBUG level logging")
     args = p.parse_args()
@@ -101,7 +104,8 @@ def main():
                       hw_info_file=args.hw_info,
                       text_pacing=_pacing(args.text_pacing),
                       xmodem_pacing=_pacing(args.xmodem_pacing),
-                      rtscts=args.rtscts)
+                      rtscts=args.rtscts,
+                      xm_command=args.xm_command)
 
     mcp_server = None
     if args.mcp:

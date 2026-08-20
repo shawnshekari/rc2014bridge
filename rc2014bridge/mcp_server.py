@@ -351,6 +351,7 @@ class McpServer:
                         f"{xmodem.get('current_block', 0)}/{xmodem.get('total_blocks', 0)}"
                         if xmodem.get("active") else "idle")
             header = (f"[state={sc.get('system_state', 'unknown')} "
+                      f"os={sc.get('os') or '-'} "
                       f"prompt={sc.get('last_prompt', '')!r} "
                       f"mode={sc.get('mode', 'terminal')} "
                       f"operation={sc.get('current_op') or 'idle'} "

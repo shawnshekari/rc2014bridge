@@ -37,6 +37,17 @@ def _constructing_serial():
 
 
 class TestReconfigure(unittest.TestCase):
+    def test_windows_port_name_is_normalized_uppercase(self):
+        # "com10" from the config file / CLI used to leak into the status
+        # bar and the settings dropdown as-is; on Windows it's normalized
+        # to the enumerated spelling.
+        with patch("os.name", "nt"), patch("serial.Serial") as mock_serial:
+            mock_serial.return_value.is_open = True
+            mock_serial.return_value.read.return_value = b""
+            link = SerialLink("com10", hw_info_file=_hw_path())
+            self.addCleanup(link.close)
+        self.assertEqual(link.port, "COM10")
+
     def test_reconfigure_updates_port_baud_rtscts_and_swaps_ser(self):
         link, fake1 = _link(baud=115200)
         self.addCleanup(link.close)
@@ -82,6 +93,98 @@ class TestReconfigure(unittest.TestCase):
         self.assertEqual(link.baud, 115200)
         self.assertIs(link._ser, fake1)
         self.assertTrue(fake1.is_open)
+
+    def test_same_port_reconfigure_closes_before_reopening(self):
+        # Windows refuses a second open of a port we already hold
+        # (PermissionError 13, "Access is denied"), so an in-place
+        # reconfigure - e.g. just toggling RTS/CTS - must close the old
+        # handle BEFORE opening the new one.
+        link, fake1 = _link(baud=115200)
+        self.addCleanup(link.close)
+
+        events = []
+        orig_close = fake1.close
+        def _close():
+            events.append("close")
+            orig_close()
+        fake1.close = _close
+
+        with patch("serial.Serial",
+                   side_effect=lambda *a, **kw: (events.append("open"), FakeSerial(*a, **kw))[1]):
+            res = link.reconfigure(rtscts=True)  # same port, same baud
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(events, ["close", "open"])
+        self.assertFalse(fake1.is_open)
+        self.assertTrue(link._ser.is_open)
+        self.assertTrue(link.rtscts)
+
+    def test_same_port_reconfigure_matches_case_insensitively(self):
+        # Windows enumerates ports uppercase ("COM10") while the config file
+        # may say "com10". A case-sensitive comparison skipped the close and
+        # the reopen then failed with PermissionError 13 (a second open of a
+        # port we already hold) - observed live on the SC126's bridge.
+        link, fake1 = _link(baud=115200)
+        self.addCleanup(link.close)
+        link.port = "com10"
+
+        events = []
+        orig_close = fake1.close
+        def _close():
+            events.append("close")
+            orig_close()
+        fake1.close = _close
+
+        # normcase is identity on POSIX, so pin the Windows behavior
+        # explicitly to keep this test portable.
+        with patch("os.path.normcase", side_effect=str.lower), \
+             patch("serial.Serial",
+                   side_effect=lambda *a, **kw: (events.append("open"), FakeSerial(*a, **kw))[1]):
+            res = link.reconfigure(port="COM10", rtscts=True)
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(events, ["close", "open"])
+        self.assertFalse(fake1.is_open)
+        self.assertTrue(link._ser.is_open)
+        self.assertEqual(link.port, "COM10")
+
+    def test_same_port_reconfigure_retries_open_after_close(self):
+        # Windows can report the port as busy for a few ms after close (the
+        # driver releases it only when the reader thread's cancelled read
+        # completes), so a transient open failure must be retried, not
+        # reported to the user as a failed reconfigure.
+        link, _ = _link(baud=115200)
+        self.addCleanup(link.close)
+
+        attempts = []
+
+        def _flaky_open(*a, **kw):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise OSError("Access is denied.")
+            return FakeSerial(*a, **kw)
+
+        with patch("serial.Serial", side_effect=_flaky_open):
+            res = link.reconfigure(rtscts=True)
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(len(attempts), 3)
+        self.assertTrue(link._ser.is_open)
+
+    def test_failed_same_port_reconfigure_restores_previous_connection(self):
+        # The old handle is closed before the reopen attempt; if the reopen
+        # fails for real, the link must not be left sitting on the
+        # disconnected placeholder.
+        link, fake1 = _link(baud=115200)
+        self.addCleanup(link.close)
+
+        with patch("serial.Serial", side_effect=[OSError("busy")] * 5 + [FakeSerial()]):
+            res = link.reconfigure(rtscts=True)
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(link.port, "/dev/fake")
+        self.assertIsNot(link._ser, fake1)  # restored, not the placeholder
+        self.assertTrue(link._ser.is_open)
 
     def test_reader_thread_survives_reconfigure(self):
         """The reader thread must not exit just because reconfigure() closed
@@ -164,6 +267,26 @@ class TestConnectionHelpers(unittest.TestCase):
             res = probe_serial_connection("/dev/nope", 115200)
         self.assertFalse(res["ok"])
         self.assertIn("no such device", res["error"])
+
+    def test_probe_connection_short_circuits_the_port_we_hold(self):
+        # The Settings screen probing our own port must not try to open it a
+        # second time - Windows denies that outright.
+        link, fake = _link(baud=115200)
+        self.addCleanup(link.close)
+        with patch("serial.Serial") as ctor:
+            res = link.probe_connection("/dev/fake", 115200)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["already_connected"])
+        ctor.assert_not_called()
+
+    def test_probe_connection_delegates_for_other_ports(self):
+        link, _ = _link(baud=115200)
+        self.addCleanup(link.close)
+        with patch("serial.Serial", return_value=FakeSerial()) as ctor:
+            res = link.probe_connection("/dev/other", 9600)
+        self.assertTrue(res["ok"])
+        self.assertNotIn("already_connected", res)
+        ctor.assert_called_once()
 
 
 class TestStartsDisconnected(unittest.TestCase):
