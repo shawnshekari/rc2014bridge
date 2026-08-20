@@ -197,7 +197,8 @@ MENU_DATA = [
 ]
 
 
-def _settings_modal_layout(screen_w: int, screen_h: int) -> dict:
+def _settings_modal_layout(screen_w: int, screen_h: int,
+                           cell_w: int = 1, cell_h: int = 1, term_y: int = 0) -> dict:
     """Rects for the Connection Settings modal - shared between the click
     handler and the renderer so hit-testing and drawing never drift apart.
 
@@ -206,10 +207,15 @@ def _settings_modal_layout(screen_w: int, screen_h: int) -> dict:
     ~171px in the 16pt bold monospace menu/status font), plus padding -
     not guessed round numbers, which is what let the label and button text
     overlap their neighbors before.
+
+    With the grid metrics supplied (cell_w/cell_h/term_y), the box is snapped
+    to character-cell boundaries so the frame never slices a glyph in the
+    terminal behind it.
     """
-    box_w, box_h = min(600, screen_w - 20), min(300, screen_h - 40)
-    box_x = (screen_w - box_w) // 2
-    box_y = (screen_h - box_h) // 2
+    box_w = min(600, (screen_w // cell_w - 2) * cell_w) // cell_w * cell_w
+    box_h = min(300, ((screen_h - term_y) // cell_h - 2) * cell_h) // cell_h * cell_h
+    box_x = ((screen_w - box_w) // 2) // cell_w * cell_w
+    box_y = term_y + ((screen_h - term_y - box_h) // 2) // cell_h * cell_h
     field_x = box_x + 250
     field_w = box_w - 250 - 16
 
@@ -817,7 +823,8 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
                     continue
 
                 if show_settings_modal:
-                    layout = _settings_modal_layout(screen_w, screen_h)
+                    layout = _settings_modal_layout(screen_w, screen_h,
+                                                    cell_w, cell_h, term_y)
 
                     if settings_port_open:
                         opt_rects = _dropdown_option_rects(layout["port_field"], settings_ports_cache)
@@ -1239,9 +1246,79 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
         # --------------------------------------------------------------
         if show_hw_info_modal:
             hw_info = getattr(link, "hardware_info", {})
-            box_w, box_h = min(720, screen_w - 20), min(500, screen_h - 40)
-            box_x = (screen_w - box_w) // 2
-            box_y = (screen_h - box_h) // 2
+            # Snap the frame to the terminal's character grid: a pixel-centred
+            # box slices through cells, leaving half-glyphs hanging off the
+            # left/right edges (the grid starts at term_y, so y snaps relative
+            # to it, not to the canvas top).
+            hdr_img = menu_font.render(" RC2014 Hardware, OS & Disk Drive Inventory ", True, (255, 255, 255))
+            close_hint = status_font.render("[Esc/F5 to Close]", True, (180, 210, 240))
+
+            # Hardware & OS specs, as captured from the boot banner. Shown as
+            # "not captured" rather than a plausible-looking guess, so the panel
+            # never claims specs for a machine it hasn't actually read.
+            not_captured = "not captured - reboot to capture"
+            os_line = (hw_info.get("nzcom_version") or hw_info.get("z3plus_version")
+                       or hw_info.get("zpm3_version") or hw_info.get("cpm3_version")
+                       or hw_info.get("zsdos_version") or hw_info.get("cpm_version")
+                       or "")
+            if os_line and hw_info.get("boot_volume"):
+                os_line = f"{os_line} - volume {hw_info['boot_volume']}"
+            if os_line and hw_info.get("tpa"):
+                os_line = f"{os_line} ({hw_info['tpa']})"
+            spec_rows = [
+                (menu_font.render(f" {label:<18}", True, (140, 180, 220)),
+                 menu_font.render(f"{val}", True, (255, 255, 255)))
+                for label, val in [
+                    ("RomWBW Version:", hw_info.get("version") or not_captured),
+                    ("CPU Architecture:", hw_info.get("cpu") or not_captured),
+                    ("Memory / MMU:", hw_info.get("memory") or not_captured),
+                    ("Operating System:", os_line or not_captured),
+                ]
+            ]
+            dev_hdr = menu_font.render(" Disk Drive Catalogue (F6 to Scan):", True, (140, 180, 220))
+
+            drives = hw_info.get("drives", [])
+            if not drives:
+                drives_map = hw_info.get("drive_mappings", {})
+                drives = [
+                    {"drive": f"{k}:", "device": v, "files_count": "?", "purpose": "Unscanned (Press F6 to Catalog)"}
+                    for k, v in list(drives_map.items())[:10]
+                ]
+            drive_rows = []
+            for drv in drives:
+                d_name = drv.get("drive", "")
+                d_dev = drv.get("device", "")
+                d_count = drv.get("files_count", 0)
+                d_free = drv.get("free_space", "")
+                d_purp = drv.get("purpose", "")
+                space_str = f", {d_free} free" if d_free and d_free != "?" else ""
+                drive_rows.append((
+                    font.render(f"   * {d_name:<3} [{d_dev:<7}] ({d_count:>2} files{space_str})", True, (200, 230, 200)),
+                    font.render(f" -> {d_purp}", True, (255, 215, 120))))
+
+            # The purpose column shares one x for every row - the widest label
+            # sets it - so the arrows form a straight line instead of following
+            # each row's own free-space string length.
+            purp_x_off = 12 + max((l.get_width() for l, _ in drive_rows), default=0) + 10
+
+            # Size the box to its content, not the other way round: a fixed
+            # 720px width let the purpose column spill past the right edge
+            # whenever a row ran long.
+            content_w = max(
+                [12 + 200 + v.get_width() for _, v in spec_rows]
+                + [purp_x_off + p.get_width() for _, p in drive_rows]
+                + [12 + dev_hdr.get_width(),
+                   8 + hdr_img.get_width() + 20 + close_hint.get_width() + 10]) + 12
+            row_h = 22
+            content_h = 38 + 24 * len(spec_rows) + 6 + 24 + row_h * max(1, len(drive_rows)) + 12
+            max_box_w = (screen_w // cell_w - 2) * cell_w
+            max_box_h = ((screen_h - term_y) // cell_h - 2) * cell_h
+            # Snap UP to whole cells when the content fits: snapping down
+            # would shave pixels off the longest line.
+            box_w = (-(-content_w // cell_w)) * cell_w if content_w <= max_box_w else max_box_w
+            box_h = (-(-content_h // cell_h)) * cell_h if content_h <= max_box_h else max_box_h
+            box_x = ((screen_w - box_w) // 2) // cell_w * cell_w
+            box_y = term_y + ((screen_h - term_y - box_h) // 2) // cell_h * cell_h
             modal_rect = pygame.Rect(box_x, box_y, box_w, box_h)
 
             pygame.draw.rect(surface, (20, 24, 30), modal_rect)
@@ -1252,80 +1329,43 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             pygame.draw.rect(surface, (30, 50, 80), hdr_rect)
             pygame.draw.line(surface, (60, 110, 180), (box_x, box_y + 31), (box_x + box_w, box_y + 31))
 
-            hdr_img = menu_font.render(" RC2014 Hardware, OS & Disk Drive Inventory ", True, (255, 255, 255))
+            # Never let text bleed past the frame, content-sized box or not
+            # (a very narrow window can still force the box smaller than the
+            # longest line).
+            surface.set_clip(modal_rect)
             surface.blit(hdr_img, (box_x + 8, box_y + 6))
-
-            close_hint = status_font.render("[Esc/F5 to Close]", True, (180, 210, 240))
             surface.blit(close_hint, (box_x + box_w - close_hint.get_width() - 10, box_y + 6))
 
-            # Hardware & OS specs, as captured from the boot banner. Shown as
-            # "not captured" rather than a plausible-looking guess, so the panel
-            # never claims specs for a machine it hasn't actually read.
             y_curr = box_y + 38
-            not_captured = "not captured - reboot to capture"
-            os_line = (hw_info.get("nzcom_version") or hw_info.get("z3plus_version")
-                       or hw_info.get("zpm3_version") or hw_info.get("cpm3_version")
-                       or hw_info.get("zsdos_version") or hw_info.get("cpm_version")
-                       or "")
-            if os_line and hw_info.get("boot_volume"):
-                os_line = f"{os_line} - volume {hw_info['boot_volume']}"
-            if os_line and hw_info.get("tpa"):
-                os_line = f"{os_line} ({hw_info['tpa']})"
-            lines_to_show = [
-                ("RomWBW Version:", hw_info.get("version") or not_captured),
-                ("CPU Architecture:", hw_info.get("cpu") or not_captured),
-                ("Memory / MMU:", hw_info.get("memory") or not_captured),
-                ("Operating System:", os_line or not_captured),
-            ]
-
-            for label, val in lines_to_show:
-                lbl_img = menu_font.render(f" {label:<18}", True, (140, 180, 220))
-                val_img = menu_font.render(f"{val}", True, (255, 255, 255))
+            for lbl_img, val_img in spec_rows:
                 surface.blit(lbl_img, (box_x + 12, y_curr))
                 surface.blit(val_img, (box_x + 200, y_curr))
                 y_curr += 24
 
             # Scanned Drive Inventory Table
             y_curr += 6
-            dev_hdr = menu_font.render(" Disk Drive Catalogue (F6 to Scan):", True, (140, 180, 220))
             surface.blit(dev_hdr, (box_x + 12, y_curr))
             y_curr += 24
 
-            drives = hw_info.get("drives", [])
-            if not drives:
-                drives_map = hw_info.get("drive_mappings", {})
-                drives = [
-                    {"drive": f"{k}:", "device": v, "files_count": "?", "purpose": "Unscanned (Press F6 to Catalog)"}
-                    for k, v in list(drives_map.items())[:10]
-                ]
-
             # Fit as many rows as the box has room for; say how many were
             # clipped instead of silently dropping them.
-            row_h = 22
             max_rows = max(1, (box_y + box_h - 12 - y_curr) // row_h)
-            for drv in drives[:max_rows]:
-                d_name = drv.get("drive", "")
-                d_dev = drv.get("device", "")
-                d_count = drv.get("files_count", 0)
-                d_free = drv.get("free_space", "")
-                d_purp = drv.get("purpose", "")
-
-                space_str = f", {d_free} free" if d_free and d_free != "?" else ""
-                lbl_img = font.render(f"   * {d_name:<3} [{d_dev:<7}] ({d_count:>2} files{space_str})", True, (200, 230, 200))
-                purp_img = font.render(f" -> {d_purp}", True, (255, 215, 120))
+            for lbl_img, purp_img in drive_rows[:max_rows]:
                 surface.blit(lbl_img, (box_x + 12, y_curr))
-                surface.blit(purp_img, (box_x + 12 + lbl_img.get_width() + 10, y_curr))
-                y_curr += 22
+                surface.blit(purp_img, (box_x + purp_x_off, y_curr))
+                y_curr += row_h
 
-            if len(drives) > max_rows:
-                more_img = font.render(f"   ... and {len(drives) - max_rows} more drive(s)", True, (150, 170, 190))
+            if len(drive_rows) > max_rows:
+                more_img = font.render(f"   ... and {len(drive_rows) - max_rows} more drive(s)", True, (150, 170, 190))
                 surface.blit(more_img, (box_x + 12, y_curr))
+            surface.set_clip(None)
 
         # --------------------------------------------------------------
         # 5b. Render Connection Settings Modal Overlay (if active)
         # --------------------------------------------------------------
         if show_settings_modal:
-            layout = _settings_modal_layout(screen_w, screen_h)
+            layout = _settings_modal_layout(screen_w, screen_h,
+                                            cell_w, cell_h, term_y)
             box = layout["box"]
 
             pygame.draw.rect(surface, (20, 24, 30), box)
@@ -1504,8 +1544,19 @@ def run(link, config_path: str = bridge_config.DEFAULT_CONFIG_PATH, title: str =
             cur_b = xp.get("current_block", 0)
             tot_b = xp.get("total_blocks", 0)
             pct = (cur_b / tot_b * 100.0) if tot_b > 0 else 0.0
-            prog_str = (f"{filename}: {int(pct)}% ({cur_b}/{tot_b})" if tot_b > 0
-                        else f"{filename}: {cur_b} blks")
+            # Average rate since the first block moved - the handshake wait is
+            # excluded so the number reflects the wire, not the receiver's
+            # startup. Bytes are 128/1024-byte blocks, so this stays meaningful
+            # even when total_blocks is unknown (receives).
+            rate_str = ""
+            start_time = xp.get("start_time")
+            bytes_done = xp.get("bytes", 0)
+            if start_time is not None and bytes_done > 0:
+                elapsed = time.monotonic() - start_time
+                if elapsed > 0.2:
+                    rate_str = f" @ {bytes_done / elapsed / 1024.0:.1f} KB/s"
+            prog_str = (f"{filename}: {int(pct)}% ({cur_b}/{tot_b}){rate_str}" if tot_b > 0
+                        else f"{filename}: {cur_b} blks{rate_str}")
             prog_img = status_font.render(prog_str, True, (255, 255, 255))
 
             gap_start, gap_end = left_edge + 10, right_edge - 10
