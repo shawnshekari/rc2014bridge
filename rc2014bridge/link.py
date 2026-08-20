@@ -563,6 +563,11 @@ def _parse_stat_output(text: str) -> dict:
 
 
 def _parse_cpm_dir_output(text: str) -> list[str]:
+    # SDZ bolds the first letter of the file type for files with attributes
+    # (RO/SYS) - "ASM     .\x1b[1mC\x1b[mOM   8k". Left in place, the escape
+    # sequences break the extension match and every attributed file vanishes
+    # (seen on hardware: the all-RO ROM disk scanned as 0 files).
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
     files = []
     ignored = {"NO", "FILE", "DIR", "BYTES", "FREE", "USAGE", "KB", "DRIVE", "UNIT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "STAT"}
     for line in text.splitlines():
@@ -573,7 +578,10 @@ def _parse_cpm_dir_output(text: str) -> list[str]:
         parts = re.split(r"[|:]", line_clean)
         for part in parts:
             # DIR prints column pairs ("ZPATH    COM : STAT     COM"); SDZ
-            # (ZPM3) prints dotted names in plain columns ("ZPATH.COM STAT.COM").
+            # (ZPM3) pads names to 8 chars with spaces and keeps the dot with
+            # the extension ("180FIG  .COM"), collapsing to "ZPATH.COM" only
+            # when the name is already 8 chars - so the extension token may
+            # or may not carry its dot.
             tokens = part.split()
             i = 0
             while i < len(tokens):
@@ -583,13 +591,16 @@ def _parse_cpm_dir_output(text: str) -> list[str]:
                     i += 1
                 elif (i + 1 < len(tokens)
                         and re.fullmatch(r"[A-Z0-9_\$]{1,8}", tokens[i], re.IGNORECASE)
-                        and re.fullmatch(r"[A-Z0-9_\$]{1,3}", tokens[i + 1], re.IGNORECASE)):
-                    name, ext = tokens[i].upper(), tokens[i + 1].upper()
+                        and re.fullmatch(r"\.?[A-Z0-9_\$]{1,3}", tokens[i + 1], re.IGNORECASE)):
+                    name, ext = tokens[i].upper(), tokens[i + 1].upper().lstrip(".")
                     i += 2
                 else:
                     i += 1
                     continue
-                if name not in ignored:
+                # A bare size/records token ("16k", "128") is not a filename:
+                # ZSDOS DIR's "ART TXT 16k 128" columns would otherwise pair
+                # into phantom "16K.128" entries.
+                if name not in ignored and not re.fullmatch(r"\d+K?", name):
                     fname = f"{name}.{ext}"
                     if fname not in files:
                         files.append(fname)
@@ -775,13 +786,27 @@ class SerialLink:
         # _update_system_state()/_follow_hbios_baud_change().
         self._pending_hbios_baud: int | None = None
         # ZPM3 (ZCPR/CP/M+) cannot DIR user areas - use SDZ there instead.
+        # Seeded from the persisted banner info below, so a bridge that starts
+        # with the machine already sitting at a ZPM3/NZ-COM/Z3PLUS prompt (no
+        # boot banner seen by this process) still speaks the right dialect;
+        # the new-boot marker handler clears it again on the next boot.
         self._zpm3 = False
         # Which OS environment is actually up, for the badge: set from boot
         # banners (latest one wins, so layered environments like ZSDOS->NZ-COM
         # or CP/M3->Z3PLUS end on the outermost layer), falling back to the
-        # ZCPR3 prompt shape. None until something identifies itself.
+        # ZCPR3 prompt shape. Seeded from the persisted banner info below, so
+        # attaching to an already-running session still badges correctly.
         self._os_env = None
         self.hardware_info = self._load_hardware_info()
+        if self.hardware_info.get("zpm3_version"):
+            self._zpm3 = True
+            self._os_env = "zpm3"
+        elif self.hardware_info.get("nzcom_version"):
+            self._zpm3 = True
+            self._os_env = "nzcom"
+        elif self.hardware_info.get("z3plus_version"):
+            self._zpm3 = True
+            self._os_env = "z3plus"
 
         # An explicit setting wins; otherwise reuse whatever calibrate_pacing()
         # last proved on this machine, falling back to the safe defaults.
@@ -1028,6 +1053,11 @@ class SerialLink:
             return {"ok": False, "error": "System is not at CP/M prompt (A> .. P>)"}
 
         mapped = self.hardware_info.get("drive_mappings", {})
+        if self._zpm3:
+            # ZPM3 can re-map letters after boot (ASSIGN) - the persisted map
+            # is the boot-time one and may be stale by now. Refresh from the
+            # live system first; keep the persisted map if ASSIGN can't be read.
+            mapped = self._current_drive_mappings() or mapped
         drives_to_scan = list(mapped.keys()) if mapped else ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 
         self._scan_progress = {"active": True, "drive": "", "index": 0,
@@ -1501,6 +1531,10 @@ class SerialLink:
             self.hardware_info.pop("nzcom_version", None)
             self.hardware_info.pop("z3plus_version", None)
             self.hardware_info.pop("boot_volume", None)
+            # Persist the clearing too: the dialect flags are seeded from this
+            # file at startup, so a stale zpm3_version here would have the next
+            # bridge process talking SDZ to a non-ZPM3 system.
+            self._save_hardware_info()
             # The loader names the disk volume it boots ('Volume "Turbo
             # Pascal"') just BEFORE the CBIOS line, so a marker-anchored
             # forward scan can never see it. On a CBIOS marker, look back
@@ -2023,7 +2057,7 @@ class SerialLink:
 
     def _wait_for_idle_prompt(self, start_pos: int, timeout: float,
                               idle_settle: float = 0.25, after_echo: str = "",
-                              nudge_after: float = None, nudge_bytes: bytes = b" ",
+                              nudge_after: float = None, nudge_bytes: bytes = b"\r",
                               max_nudges: int = 500) -> dict:
         """Wait until a prompt is the last thing on the wire and the board has
         gone quiet.
@@ -2048,9 +2082,20 @@ class SerialLink:
         `nudge_bytes` keystroke (which the pager consumes without echoing),
         capped at `max_nudges` so a command that's genuinely hung - not
         paged - still times out rather than looping forever.
+
+        The default nudge is CR, not space: the pagers this targets ask for
+        RETURN explicitly, and a stray nudge that misses the pager and lands
+        at a fresh shell prompt is then harmless (the prompt just reprints),
+        whereas a stray space stays in ZPM3's input line and gets the *next*
+        command rejected with " ?" - ZPM3 refuses a command with a leading
+        space. Nudges are also rate-limited to one per `nudge_after`: quiet is
+        measured from the last byte *received*, so without the cooldown a slow
+        page draw would collect a keystroke every idle_settle beat, and the
+        extras would land at the prompt once the pager exits.
         """
         deadline = time.time() + timeout
         nudges = 0
+        last_nudge_at = 0.0
         with self._rx_cond:
             while True:
                 text, _pos, _trunc = self._read_since_locked(start_pos)
@@ -2067,10 +2112,12 @@ class SerialLink:
                 if remaining <= 0:
                     return {"text": text, "prompt": "", "timed_out": True, "nudges": nudges}
                 if (nudge_after is not None and nudges < max_nudges
-                        and (time.time() - self._last_rx_time) >= nudge_after):
+                        and (time.time() - self._last_rx_time) >= nudge_after
+                        and (time.time() - last_nudge_at) >= nudge_after):
                     logger.debug("no prompt after %.1fs idle; nudging a possible pager (#%d)",
                                 nudge_after, nudges + 1)
                     self._write_raw(nudge_bytes)
+                    last_nudge_at = time.time()
                     nudges += 1
                 # Always wait a beat here, nudge or not - sending one and
                 # immediately re-checking would fire a burst of keystrokes
@@ -2167,6 +2214,7 @@ class SerialLink:
                 "total_blocks": 0,
                 "bytes": 0,
                 "direction": "SEND",
+                "start_time": None,  # monotonic ts once data actually flows
             }
         try:
             time.sleep(0.3)
@@ -2201,6 +2249,8 @@ class SerialLink:
                 return {"ok": False, "error": "handshake timeout waiting for receiver"}
 
             logger.info("xmodem_send: handshake established using %s", "CRC16" if use_crc else "Checksum")
+            with self._mode_lock:
+                self._xmodem_progress["start_time"] = time.monotonic()
 
             # RomWBW's XM pokes 'C' then a trailing 'K' (it would prefer 1K
             # blocks). Drain that, or it gets read as the response to block 1.
@@ -2302,6 +2352,7 @@ class SerialLink:
                 "total_blocks": 0,
                 "bytes": 0,
                 "direction": "RECV",
+                "start_time": None,
             }
         try:
             time.sleep(0.3)  # see comment in xmodem_send
@@ -2356,6 +2407,9 @@ class SerialLink:
                 size = BLOCK_SIZE if b0 == SOH else LONG_BLOCK_SIZE
                 last_block_size = size
                 got_first = True
+                with self._mode_lock:
+                    if self._xmodem_progress.get("start_time") is None:
+                        self._xmodem_progress["start_time"] = time.monotonic()
                 blk = self._xq_get(timeout=5.0)
                 nblk = self._xq_get(timeout=5.0)
                 payload = bytearray()
@@ -2494,6 +2548,26 @@ class SerialLink:
     def _dir_command(self, target: str) -> str:
         # ZPM3 cannot DIR user areas (e.g. J1:) - SDZ is its listing command.
         return f"{'SDZ' if self._zpm3 else 'DIR'} {target}"
+
+    def _current_drive_mappings(self) -> dict:
+        """Live drive->device map from ZPM3's ASSIGN ('A:=SD0:4' lines).
+
+        The boot banner's mapping is only what the loader set up - ZPM3 can
+        re-assign letters at any time afterwards (seen in the field: A:=SD0:4,
+        B:=MD0:0), and labelling a listing with the stale boot mapping then
+        misreports both the device and every classification derived from it.
+        ASSIGN's output is authoritative; on any parse failure the caller
+        falls back to the persisted boot-time map."""
+        res = self.run_command("ASSIGN", timeout=DIR_TIMEOUT)
+        mapping = {}
+        for line in res.get("output", "").splitlines():
+            m = re.match(r"^\s*([A-P])\s*:=\s*([A-Z]+\d+:\d+)", line, re.IGNORECASE)
+            if m:
+                mapping[m.group(1).upper()] = m.group(2).upper()
+        if mapping:
+            self.hardware_info["drive_mappings"] = mapping
+            self._save_hardware_info()
+        return mapping
 
     def _erase(self, target: str) -> None:
         # ZPM3 (CP/M+ ZCPR) delete is ERASE (ERA does not exist) and it

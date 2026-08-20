@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import time
 import unittest
@@ -43,6 +44,35 @@ class TestDriveScanner(unittest.TestCase):
         self.assertIn("TEST.TXT", files)
         self.assertIn("DEMO.Z80", files)
         self.assertIn("HELLO.PAS", files)
+        self.assertIn("XM.COM", files)
+
+    def test_parse_sdz_padded_dot_names(self):
+        """SDZ pads short names with spaces and keeps the dot on the extension
+        ("180FIG  .COM"); only names already 8 chars long come out contiguous
+        ("BBCBASIC.COM"). A scan that only catches the contiguous form reports
+        a 61-file drive as having 3 files (seen on hardware)."""
+        sample = "180FIG  .COM   4k : DUMP    .LST   8k : BBCBASIC.COM  20k : ZMCONFIG.OVR  12k"
+        files = _parse_cpm_dir_output(sample)
+        self.assertIn("180FIG.COM", files)
+        self.assertIn("DUMP.LST", files)
+        self.assertIn("BBCBASIC.COM", files)
+        self.assertIn("ZMCONFIG.OVR", files)
+
+    def test_size_columns_do_not_become_phantom_files(self):
+        """ZSDOS DIR's size/records columns ("ART TXT 16k 128") used to pair
+        into phantom "16K.128" files in the scan results (seen on hardware)."""
+        files = _parse_cpm_dir_output("ART      TXT    16k    128 Dir RW")
+        self.assertEqual(files, ["ART.TXT"])
+
+    def test_ansi_bolded_extensions_still_parse(self):
+        """SDZ bolds the first letter of the type on attributed (RO/SYS)
+        files: "ASM     .\\x1b[1mC\\x1b[mOM   8k". Unstripped, the escape codes
+        broke the extension match and the all-RO ROM disk scanned as empty
+        (seen on hardware: C: reported 0 files while DIR showed 49)."""
+        sample = "ASM     .\x1b[1mC\x1b[mOM   8k : ZSYS    .\x1b[1mS\x1b[mYS  14k : XM      .\x1b[1mC\x1b[mOM   8k"
+        files = _parse_cpm_dir_output(sample)
+        self.assertIn("ASM.COM", files)
+        self.assertIn("ZSYS.SYS", files)
         self.assertIn("XM.COM", files)
 
     def test_classify_drive_purpose(self):
@@ -256,6 +286,33 @@ class TestScanDrivesZpm3(unittest.TestCase):
         self.assertFalse(any(c.startswith("DIR ") for c in self.commands))
         self.assertNotIn("STAT", self.commands)
 
+    def test_scan_follows_live_assign_mapping(self):
+        """ZPM3 can re-map drive letters after boot; the boot-banner mapping in
+        hardware_info then labels every drive with the wrong device (seen on
+        hardware: A: shown as the MD0 RAM disk while actually SD0:4). The scan
+        must trust ASSIGN's live map over the persisted one."""
+        def _responder(line: bytes):
+            cmd = line.decode("latin-1").strip().upper()
+            self.commands.append(cmd)
+            if cmd == "ASSIGN":
+                return b"\r\n   A:=SD0:4\r\n   B:=MD0:0\r\n15:45 B0>"
+            if cmd == "SDZ A:":
+                return b"\r\nA0: STARTZPM.COM\r\nFree: 4012k\r\n15:45 B0>"
+            if cmd == "SDZ B:":
+                return b"\r\n >> No detectable file(s) on B0:   Free: 248k \r\n15:45 B0>"
+            return b"\r\n15:45 B0>"
+
+        self.fake.responder = _responder
+        res = self.link.scan_drives()
+
+        self.assertTrue(res["ok"], res)
+        drives = {d["drive"]: d for d in res["drives"]}
+        self.assertEqual(drives["A:"]["device"], "SD0:4")
+        self.assertEqual(drives["B:"]["device"], "MD0:0")
+        self.assertIn("RAM Disk", drives["B:"]["purpose"])
+        self.assertNotIn("RAM Disk", drives["A:"]["purpose"])
+        self.assertEqual(self.link.hardware_info["drive_mappings"]["A"], "SD0:4")
+
 
 class TestZpm3Banner(unittest.TestCase):
     """ZPM3 announces itself at boot ('ZPM3 [BANKED] for HBIOS vX.Y'); no
@@ -306,6 +363,21 @@ class TestZpm3Banner(unittest.TestCase):
         self.assertFalse(link._zpm3)
         self.assertEqual(link.get_screen()["os"], "cpm")
         self.assertEqual(link.hardware_info.get("cpm_version"), "CP/M-80 v2.2")
+
+    def test_dialect_seeded_from_persisted_banner_info(self):
+        """A bridge that starts with the machine already at a ZPM3 prompt sees
+        no boot banner this process; without seeding from the persisted banner
+        info it speaks DIR/STAT to a ZPM3 system and the scan falls apart
+        (STAT -> ' ?', seen on hardware)."""
+        hw = os.path.join(tempfile.mkdtemp(prefix="rc2014-test-"), "hw.json")
+        with open(hw, "w") as f:
+            json.dump({"zpm3_version": "ZPM3 for HBIOS v3.7.0-dev.13"}, f)
+        fake = FakeSerial()
+        with patch("serial.Serial", return_value=fake):
+            link = SerialLink("/dev/fake", hw_info_file=hw)
+        self.addCleanup(link.close)
+        self.assertTrue(link._zpm3)
+        self.assertEqual(link._os_env, "zpm3")
 
     def test_zpm3_clock_prompt_alone_does_not_flag(self):
         # Prompt shape never identifies the OS flavour (ZPM3/NZ-COM/Z3PLUS
